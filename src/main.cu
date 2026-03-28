@@ -469,6 +469,22 @@ void print_memory_report(const MemoryReport& report) {
     std::cout << per_cell.str() << '\n';
 }
 
+void apply_user_node_type_primitives(std::vector<std::uint8_t>* node_type, const SimulationConfig& cfg) {
+    (void)node_type;
+    (void)cfg;
+
+    // Host-side geometry stamping hook. Leave it empty for the baseline duct,
+    // or add calls such as:
+    //
+    // lbm::fill_box(node_type, cfg, lbm::kWall, 8, 12, 6, 10, 6, 10);
+    // lbm::fill_ball(node_type, cfg, lbm::kWall, 20.0, 12.0, 12.0, 4.0);
+    // lbm::fill_plane(node_type, cfg, lbm::kInlet, lbm::PrimitiveAxis::X, 4, 0, 1, cfg.ny - 2, 1, cfg.nz - 2);
+    // lbm::fill_cylinder(node_type, cfg, lbm::kWall, lbm::PrimitiveAxis::X, 12.0, 12.0, 3.0, 10, 30);
+    //
+    // The node map is uploaded once after this hook and then used by both the
+    // equilibrium initialization and all subsequent boundary kernels.
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -511,23 +527,22 @@ int main(int argc, char** argv) {
         std::array<int, lbm::kQ> shift_x{};
         std::array<int, lbm::kQ> shift_y{};
         std::array<int, lbm::kQ> shift_z{};
-        lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial x shifts");
-        lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial y shifts");
-        lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial z shifts");
-
-        lbm::launch_classify_nodes(d_node_type, cfg);
-        lbm::launch_initialize_equilibrium(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
-        lbm::cuda_check(cudaDeviceSynchronize(), "initialize solver state");
-
         std::vector<std::uint8_t> host_node_type(cell_count, 0);
         std::vector<Real> host_rho(cell_count, Real(0.0));
         std::vector<Real> host_ux(cell_count, Real(0.0));
         std::vector<Real> host_uy(cell_count, Real(0.0));
         std::vector<Real> host_uz(cell_count, Real(0.0));
+        lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial x shifts");
+        lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial y shifts");
+        lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial z shifts");
 
+        lbm::build_default_node_type_map(&host_node_type, cfg);
+        apply_user_node_type_primitives(&host_node_type, cfg);
         lbm::cuda_check(
-            cudaMemcpy(host_node_type.data(), d_node_type, sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count), cudaMemcpyDeviceToHost),
+            cudaMemcpy(d_node_type, host_node_type.data(), sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count), cudaMemcpyHostToDevice),
             "copy node type field");
+        lbm::launch_initialize_equilibrium(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+        lbm::cuda_check(cudaDeviceSynchronize(), "initialize solver state");
 
         std::ofstream diagnostics_csv(runtime.diagnostics_csv);
         if (!diagnostics_csv) {

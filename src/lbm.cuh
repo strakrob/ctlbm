@@ -45,6 +45,12 @@ enum class InletProfile : int {
     Parabolic = 1,
 };
 
+enum class PrimitiveAxis : int {
+    X = 0,
+    Y = 1,
+    Z = 2,
+};
+
 enum NodeType : std::uint8_t {
     kFluid = 0,
     kWall = 1,
@@ -218,6 +224,50 @@ void launch_apply_velocity_boundaries(
     const int* d_sx,
     const int* d_sy,
     const int* d_sz);
+
+void build_default_node_type_map(std::vector<std::uint8_t>* node_type, const SimulationConfig& cfg);
+
+// Host-side map editing helpers for stamping interior obstacle / boundary
+// primitives into the node-type field before it is uploaded to the GPU.
+void fill_box(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    int x0,
+    int x1,
+    int y0,
+    int y1,
+    int z0,
+    int z1);
+void fill_ball(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    Real center_x,
+    Real center_y,
+    Real center_z,
+    Real radius);
+void fill_plane(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    PrimitiveAxis normal_axis,
+    int coordinate,
+    int half_thickness,
+    int span0_begin,
+    int span0_end,
+    int span1_begin,
+    int span1_end);
+void fill_cylinder(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    PrimitiveAxis axis,
+    Real center_a,
+    Real center_b,
+    Real radius,
+    int axis_begin,
+    int axis_end);
 
 void write_vti(
     const std::string& filename,

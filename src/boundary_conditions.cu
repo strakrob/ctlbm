@@ -1,8 +1,28 @@
 #include "lbm.cuh"
 
+#include <algorithm>
+#include <cmath>
+
 namespace lbm {
 
 namespace {
+
+inline int clamp_index(int value, int lo, int hi) {
+    return value < lo ? lo : (value > hi ? hi : value);
+}
+
+inline void set_host_node_type(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    int x,
+    int y,
+    int z,
+    NodeType fill_type) {
+    if (x < 0 || x >= cfg.nx || y < 0 || y >= cfg.ny || z < 0 || z >= cfg.nz) {
+        return;
+    }
+    (*node_type)[flatten_xyz(x, y, z, cfg.nx, cfg.ny, cfg.nz)] = static_cast<std::uint8_t>(fill_type);
+}
 
 __device__ inline Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
@@ -282,6 +302,205 @@ void launch_apply_velocity_boundaries(
     const int blocks = (yz_count + kBlockSize - 1) / kBlockSize;
     apply_velocity_boundaries_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
     cuda_check(cudaGetLastError(), "launch apply_velocity_boundaries_kernel");
+}
+
+void build_default_node_type_map(std::vector<std::uint8_t>* node_type, const SimulationConfig& cfg) {
+    if (node_type == nullptr) {
+        throw std::runtime_error("build_default_node_type_map requires a valid node map.");
+    }
+
+    node_type->assign(static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz), static_cast<std::uint8_t>(kFluid));
+
+    for (int z = 0; z < cfg.nz; ++z) {
+        for (int y = 0; y < cfg.ny; ++y) {
+            for (int x = 0; x < cfg.nx; ++x) {
+                NodeType type = kFluid;
+                if (y == 0 || y == cfg.ny - 1 || z == 0 || z == cfg.nz - 1) {
+                    type = kWall;
+                } else if (cfg.mode != StreamwiseMode::PeriodicBodyForce && x == 0) {
+                    type = kInlet;
+                } else if (cfg.mode != StreamwiseMode::PeriodicBodyForce && x == cfg.nx - 1) {
+                    type = kOutlet;
+                }
+                set_host_node_type(node_type, cfg, x, y, z, type);
+            }
+        }
+    }
+}
+
+void fill_box(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    int x0,
+    int x1,
+    int y0,
+    int y1,
+    int z0,
+    int z1) {
+    if (node_type == nullptr || node_type->size() != static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz)) {
+        throw std::runtime_error("fill_box requires a node map sized to nx * ny * nz.");
+    }
+
+    const int xs = clamp_index(std::min(x0, x1), 0, cfg.nx - 1);
+    const int xe = clamp_index(std::max(x0, x1), 0, cfg.nx - 1);
+    const int ys = clamp_index(std::min(y0, y1), 0, cfg.ny - 1);
+    const int ye = clamp_index(std::max(y0, y1), 0, cfg.ny - 1);
+    const int zs = clamp_index(std::min(z0, z1), 0, cfg.nz - 1);
+    const int ze = clamp_index(std::max(z0, z1), 0, cfg.nz - 1);
+
+    for (int z = zs; z <= ze; ++z) {
+        for (int y = ys; y <= ye; ++y) {
+            for (int x = xs; x <= xe; ++x) {
+                set_host_node_type(node_type, cfg, x, y, z, fill_type);
+            }
+        }
+    }
+}
+
+void fill_ball(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    Real center_x,
+    Real center_y,
+    Real center_z,
+    Real radius) {
+    if (node_type == nullptr || node_type->size() != static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz)) {
+        throw std::runtime_error("fill_ball requires a node map sized to nx * ny * nz.");
+    }
+    if (radius < Real(0.0)) {
+        throw std::runtime_error("fill_ball requires a non-negative radius.");
+    }
+
+    const Real radius_sq = radius * radius;
+    const int xs = clamp_index(static_cast<int>(std::floor(center_x - radius)), 0, cfg.nx - 1);
+    const int xe = clamp_index(static_cast<int>(std::ceil(center_x + radius)), 0, cfg.nx - 1);
+    const int ys = clamp_index(static_cast<int>(std::floor(center_y - radius)), 0, cfg.ny - 1);
+    const int ye = clamp_index(static_cast<int>(std::ceil(center_y + radius)), 0, cfg.ny - 1);
+    const int zs = clamp_index(static_cast<int>(std::floor(center_z - radius)), 0, cfg.nz - 1);
+    const int ze = clamp_index(static_cast<int>(std::ceil(center_z + radius)), 0, cfg.nz - 1);
+
+    for (int z = zs; z <= ze; ++z) {
+        for (int y = ys; y <= ye; ++y) {
+            for (int x = xs; x <= xe; ++x) {
+                const Real dx = Real(x) - center_x;
+                const Real dy = Real(y) - center_y;
+                const Real dz = Real(z) - center_z;
+                if (dx * dx + dy * dy + dz * dz <= radius_sq) {
+                    set_host_node_type(node_type, cfg, x, y, z, fill_type);
+                }
+            }
+        }
+    }
+}
+
+void fill_plane(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    PrimitiveAxis normal_axis,
+    int coordinate,
+    int half_thickness,
+    int span0_begin,
+    int span0_end,
+    int span1_begin,
+    int span1_end) {
+    if (node_type == nullptr || node_type->size() != static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz)) {
+        throw std::runtime_error("fill_plane requires a node map sized to nx * ny * nz.");
+    }
+    if (half_thickness < 0) {
+        throw std::runtime_error("fill_plane requires a non-negative half_thickness.");
+    }
+
+    if (normal_axis == PrimitiveAxis::X) {
+        fill_box(node_type, cfg, fill_type, coordinate - half_thickness, coordinate + half_thickness, span0_begin, span0_end, span1_begin, span1_end);
+    } else if (normal_axis == PrimitiveAxis::Y) {
+        fill_box(node_type, cfg, fill_type, span0_begin, span0_end, coordinate - half_thickness, coordinate + half_thickness, span1_begin, span1_end);
+    } else {
+        fill_box(node_type, cfg, fill_type, span0_begin, span0_end, span1_begin, span1_end, coordinate - half_thickness, coordinate + half_thickness);
+    }
+}
+
+void fill_cylinder(
+    std::vector<std::uint8_t>* node_type,
+    const SimulationConfig& cfg,
+    NodeType fill_type,
+    PrimitiveAxis axis,
+    Real center_a,
+    Real center_b,
+    Real radius,
+    int axis_begin,
+    int axis_end) {
+    if (node_type == nullptr || node_type->size() != static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz)) {
+        throw std::runtime_error("fill_cylinder requires a node map sized to nx * ny * nz.");
+    }
+    if (radius < Real(0.0)) {
+        throw std::runtime_error("fill_cylinder requires a non-negative radius.");
+    }
+
+    const int as = std::min(axis_begin, axis_end);
+    const int ae = std::max(axis_begin, axis_end);
+    const Real radius_sq = radius * radius;
+
+    if (axis == PrimitiveAxis::X) {
+        const int xs = clamp_index(as, 0, cfg.nx - 1);
+        const int xe = clamp_index(ae, 0, cfg.nx - 1);
+        const int ys = clamp_index(static_cast<int>(std::floor(center_a - radius)), 0, cfg.ny - 1);
+        const int ye = clamp_index(static_cast<int>(std::ceil(center_a + radius)), 0, cfg.ny - 1);
+        const int zs = clamp_index(static_cast<int>(std::floor(center_b - radius)), 0, cfg.nz - 1);
+        const int ze = clamp_index(static_cast<int>(std::ceil(center_b + radius)), 0, cfg.nz - 1);
+        for (int z = zs; z <= ze; ++z) {
+            for (int y = ys; y <= ye; ++y) {
+                const Real da = Real(y) - center_a;
+                const Real db = Real(z) - center_b;
+                if (da * da + db * db > radius_sq) {
+                    continue;
+                }
+                for (int x = xs; x <= xe; ++x) {
+                    set_host_node_type(node_type, cfg, x, y, z, fill_type);
+                }
+            }
+        }
+    } else if (axis == PrimitiveAxis::Y) {
+        const int ys = clamp_index(as, 0, cfg.ny - 1);
+        const int ye = clamp_index(ae, 0, cfg.ny - 1);
+        const int xs = clamp_index(static_cast<int>(std::floor(center_a - radius)), 0, cfg.nx - 1);
+        const int xe = clamp_index(static_cast<int>(std::ceil(center_a + radius)), 0, cfg.nx - 1);
+        const int zs = clamp_index(static_cast<int>(std::floor(center_b - radius)), 0, cfg.nz - 1);
+        const int ze = clamp_index(static_cast<int>(std::ceil(center_b + radius)), 0, cfg.nz - 1);
+        for (int z = zs; z <= ze; ++z) {
+            for (int x = xs; x <= xe; ++x) {
+                const Real da = Real(x) - center_a;
+                const Real db = Real(z) - center_b;
+                if (da * da + db * db > radius_sq) {
+                    continue;
+                }
+                for (int y = ys; y <= ye; ++y) {
+                    set_host_node_type(node_type, cfg, x, y, z, fill_type);
+                }
+            }
+        }
+    } else {
+        const int zs = clamp_index(as, 0, cfg.nz - 1);
+        const int ze = clamp_index(ae, 0, cfg.nz - 1);
+        const int xs = clamp_index(static_cast<int>(std::floor(center_a - radius)), 0, cfg.nx - 1);
+        const int xe = clamp_index(static_cast<int>(std::ceil(center_a + radius)), 0, cfg.nx - 1);
+        const int ys = clamp_index(static_cast<int>(std::floor(center_b - radius)), 0, cfg.ny - 1);
+        const int ye = clamp_index(static_cast<int>(std::ceil(center_b + radius)), 0, cfg.ny - 1);
+        for (int y = ys; y <= ye; ++y) {
+            for (int x = xs; x <= xe; ++x) {
+                const Real da = Real(x) - center_a;
+                const Real db = Real(y) - center_b;
+                if (da * da + db * db > radius_sq) {
+                    continue;
+                }
+                for (int z = zs; z <= ze; ++z) {
+                    set_host_node_type(node_type, cfg, x, y, z, fill_type);
+                }
+            }
+        }
+    }
 }
 
 }  // namespace lbm

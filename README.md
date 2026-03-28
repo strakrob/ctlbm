@@ -91,11 +91,30 @@ Implemented outlet variants:
 
 Each timestep uses this order:
 
-1. update logical shifts,
-2. collide and stream into the single DF array through the new shifts,
+1. collide and stream in place while reading and writing through the current logical shifts,
+2. advance the logical shifts on the host,
 3. apply wall bounce-back on y/z wall nodes,
 4. apply streamwise inlet/outlet reconstruction for Mode B or Mode C,
 5. recover `rho`, `ux`, `uy`, `uz` for diagnostics and output when requested.
+
+## Geometry stamping
+
+The node-type map is now built on the host before initialization and uploaded
+once to the GPU. This keeps custom geometry setup explicit and lets you stamp
+additional primitives into the map without touching the device kernels.
+
+Available host-side helpers in `src/boundary_conditions.cu`:
+
+- `build_default_node_type_map(...)` for the baseline duct walls and x-boundary planes,
+- `fill_box(...)`,
+- `fill_ball(...)`,
+- `fill_plane(...)`,
+- `fill_cylinder(...)`.
+
+The intended customization point is `apply_user_node_type_primitives(...)` in
+`src/main.cu`. It is empty by default and contains example calls for stamping
+extra wall, inlet, or outlet regions into the node map before the equilibrium
+field is initialized.
 
 ## Build
 
@@ -243,4 +262,3 @@ The implementation uses an explicit wall-node layer on the four duct walls in `y
 
 - This implementation prioritizes clarity and inspectability over aggressive CUDA optimization.
 - The pressure and velocity streamwise boundaries use local non-equilibrium extrapolation style reconstruction rather than a more elaborate higher-order formulation.
-- Because the environment used for this implementation did not provide `nvcc`, the code could not be built locally here; use the build commands above on a CUDA-enabled Linux machine to compile and run it.
