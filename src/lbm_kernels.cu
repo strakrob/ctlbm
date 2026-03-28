@@ -10,13 +10,13 @@ __device__ __constant__ Real g_w[kQ];
 
 namespace {
 
-__device__ inline Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
+__device__ LBM_FORCEINLINE Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
     const Real uu = ux * ux + uy * uy + uz * uz;
     return g_w[q] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu);
 }
 
-__device__ inline Real guo_force_term(int q, Real ux, Real uy, Real uz, Real fx, Real fy, Real fz, Real omega) {
+__device__ LBM_FORCEINLINE Real guo_force_term(int q, Real ux, Real uy, Real uz, Real fx, Real fy, Real fz, Real omega) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
     const Real c_minus_u_x = Real(g_cx[q]) - ux;
     const Real c_minus_u_y = Real(g_cy[q]) - uy;
@@ -29,19 +29,20 @@ __device__ inline Real guo_force_term(int q, Real ux, Real uy, Real uz, Real fx,
     return g_w[q] * (Real(1.0) - Real(0.5) * omega) * forcing_projection;
 }
 
-__device__ inline void load_logical_cell(
-    const Real* f,
+__device__ LBM_FORCEINLINE void load_logical_cell(
+    const Real* LBM_RESTRICT f,
     int x,
     int y,
     int z,
     int nx,
     int ny,
     int nz,
-    const int* sx,
-    const int* sy,
-    const int* sz,
-    Real* populations) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz,
+    Real* LBM_RESTRICT populations) {
     const int cell_count = nx * ny * nz;
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         // The logical field for direction q is stored with its own running shift.
         const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
@@ -49,19 +50,20 @@ __device__ inline void load_logical_cell(
     }
 }
 
-__device__ inline void recover_macro_from_populations(
-    const Real* populations,
+__device__ LBM_FORCEINLINE void recover_macro_from_populations(
+    const Real* LBM_RESTRICT populations,
     Real force_x,
     Real force_y,
     Real force_z,
-    Real* rho,
-    Real* ux,
-    Real* uy,
-    Real* uz) {
+    Real* LBM_RESTRICT rho,
+    Real* LBM_RESTRICT ux,
+    Real* LBM_RESTRICT uy,
+    Real* LBM_RESTRICT uz) {
     Real density = Real(0.0);
     Real mx = Real(0.0);
     Real my = Real(0.0);
     Real mz = Real(0.0);
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const Real fq = populations[q];
         density += fq;
@@ -77,7 +79,7 @@ __device__ inline void recover_macro_from_populations(
     *uz = (mz + Real(0.5) * force_z) / density;
 }
 
-__global__ void classify_nodes_kernel(std::uint8_t* node_type, SimulationConfig cfg) {
+__global__ __launch_bounds__(kBlockSize) void classify_nodes_kernel(std::uint8_t* LBM_RESTRICT node_type, SimulationConfig cfg) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= cell_count) {
@@ -108,13 +110,13 @@ __global__ void classify_nodes_kernel(std::uint8_t* node_type, SimulationConfig 
     }
 }
 
-__global__ void initialize_equilibrium_kernel(
-    Real* f,
-    const std::uint8_t* node_type,
+__global__ __launch_bounds__(kBlockSize) void initialize_equilibrium_kernel(
+    Real* LBM_RESTRICT f,
+    const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* sx,
-    const int* sy,
-    const int* sz) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= cell_count) {
@@ -141,19 +143,20 @@ __global__ void initialize_equilibrium_kernel(
         ux = prescribed_inlet_velocity_x(y, z, cfg);
     }
 
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const int cell = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz);
         f[distribution_index(q, cell, cell_count)] = equilibrium(q, rho, ux, uy, uz);
     }
 }
 
-__global__ void collide_and_stream_kernel(
-    Real* f,
-    const std::uint8_t* node_type,
+__global__ __launch_bounds__(kBlockSize) void collide_and_stream_kernel(
+    Real* LBM_RESTRICT f,
+    const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* current_sx,
-    const int* current_sy,
-    const int* current_sz) {
+    const int* LBM_RESTRICT current_sx,
+    const int* LBM_RESTRICT current_sy,
+    const int* LBM_RESTRICT current_sz) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= cell_count) {
@@ -168,10 +171,13 @@ __global__ void collide_and_stream_kernel(
     Real populations[kQ];
     load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz, populations);
 
-    if (node_type[tid] != kFluid) {
+    const std::uint8_t type = node_type[tid];
+
+    if (type != kFluid) {
         // Walls and explicit inlet/outlet planes are not collided as ordinary
         // fluid nodes. They are carried forward into the new logical shift
         // state and then overwritten by dedicated boundary kernels.
+        #pragma unroll
         for (int q = 0; q < kQ; ++q) {
             const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
             f[distribution_index(q, dst, cell_count)] = populations[q];
@@ -189,6 +195,7 @@ __global__ void collide_and_stream_kernel(
     Real uz = Real(0.0);
     recover_macro_from_populations(populations, fx, fy, fz, &rho, &ux, &uy, &uz);
 
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const Real feq = equilibrium(q, rho, ux, uy, uz);
         const Real force_term = guo_force_term(q, ux, uy, uz, fx, fy, fz, cfg.omega);
@@ -202,17 +209,17 @@ __global__ void collide_and_stream_kernel(
     }
 }
 
-__global__ void recover_macros_kernel(
-    const Real* f,
-    const std::uint8_t* node_type,
+__global__ __launch_bounds__(kBlockSize) void recover_macros_kernel(
+    const Real* LBM_RESTRICT f,
+    const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* sx,
-    const int* sy,
-    const int* sz,
-    Real* rho,
-    Real* ux,
-    Real* uy,
-    Real* uz) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz,
+    Real* LBM_RESTRICT rho,
+    Real* LBM_RESTRICT ux,
+    Real* LBM_RESTRICT uy,
+    Real* LBM_RESTRICT uz) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= cell_count) {
@@ -227,7 +234,8 @@ __global__ void recover_macros_kernel(
     Real populations[kQ];
     load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, populations);
 
-    const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce && node_type[tid] != kWall) ? cfg.body_force_x : Real(0.0);
+    const std::uint8_t type = node_type[tid];
+    const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce && type != kWall) ? cfg.body_force_x : Real(0.0);
 
     Real density = Real(0.0);
     Real vx = Real(0.0);
@@ -236,9 +244,9 @@ __global__ void recover_macros_kernel(
     recover_macro_from_populations(populations, fx, Real(0.0), Real(0.0), &density, &vx, &vy, &vz);
 
     rho[tid] = density;
-    ux[tid] = (node_type[tid] == kWall) ? Real(0.0) : vx;
-    uy[tid] = (node_type[tid] == kWall) ? Real(0.0) : vy;
-    uz[tid] = (node_type[tid] == kWall) ? Real(0.0) : vz;
+    ux[tid] = (type == kWall) ? Real(0.0) : vx;
+    uy[tid] = (type == kWall) ? Real(0.0) : vy;
+    uz[tid] = (type == kWall) ? Real(0.0) : vz;
 }
 
 }  // namespace

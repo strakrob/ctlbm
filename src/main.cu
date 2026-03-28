@@ -422,9 +422,9 @@ void update_shift_vectors(
     // the host advances the cumulative offsets so all subsequent accesses use
     // that new streamed state.
     for (int q = 0; q < lbm::kQ; ++q) {
-        (*sx)[q] = lbm::wrap_index((*sx)[q] + lbm::kCx[q], cfg.nx);
-        (*sy)[q] = lbm::wrap_index((*sy)[q] + lbm::kCy[q], cfg.ny);
-        (*sz)[q] = lbm::wrap_index((*sz)[q] + lbm::kCz[q], cfg.nz);
+        (*sx)[q] = lbm::advance_shift_index((*sx)[q], lbm::kCx[q], cfg.nx);
+        (*sy)[q] = lbm::advance_shift_index((*sy)[q], lbm::kCy[q], cfg.ny);
+        (*sz)[q] = lbm::advance_shift_index((*sz)[q], lbm::kCz[q], cfg.nz);
     }
 }
 

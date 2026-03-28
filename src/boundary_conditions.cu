@@ -24,33 +24,34 @@ inline void set_host_node_type(
     (*node_type)[flatten_xyz(x, y, z, cfg.nx, cfg.ny, cfg.nz)] = static_cast<std::uint8_t>(fill_type);
 }
 
-__device__ inline Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
+__device__ LBM_FORCEINLINE Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
     const Real uu = ux * ux + uy * uy + uz * uz;
     return g_w[q] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu);
 }
 
-__device__ inline void load_logical_cell(
-    const Real* f,
+__device__ LBM_FORCEINLINE void load_logical_cell(
+    const Real* LBM_RESTRICT f,
     int x,
     int y,
     int z,
     int nx,
     int ny,
     int nz,
-    const int* sx,
-    const int* sy,
-    const int* sz,
-    Real* populations) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz,
+    Real* LBM_RESTRICT populations) {
     const int cell_count = nx * ny * nz;
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
         populations[q] = f[distribution_index(q, cell, cell_count)];
     }
 }
 
-__device__ inline void store_logical_population(
-    Real* f,
+__device__ LBM_FORCEINLINE void store_logical_population(
+    Real* LBM_RESTRICT f,
     int q,
     int x,
     int y,
@@ -67,19 +68,20 @@ __device__ inline void store_logical_population(
     f[distribution_index(q, cell, cell_count)] = value;
 }
 
-__device__ inline void recover_macro_from_populations(
-    const Real* populations,
+__device__ LBM_FORCEINLINE void recover_macro_from_populations(
+    const Real* LBM_RESTRICT populations,
     Real force_x,
     Real force_y,
     Real force_z,
-    Real* rho,
-    Real* ux,
-    Real* uy,
-    Real* uz) {
+    Real* LBM_RESTRICT rho,
+    Real* LBM_RESTRICT ux,
+    Real* LBM_RESTRICT uy,
+    Real* LBM_RESTRICT uz) {
     Real density = Real(0.0);
     Real mx = Real(0.0);
     Real my = Real(0.0);
     Real mz = Real(0.0);
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         density += populations[q];
         mx += populations[q] * Real(g_cx[q]);
@@ -94,13 +96,13 @@ __device__ inline void recover_macro_from_populations(
     *uz = (mz + Real(0.5) * force_z) / density;
 }
 
-__global__ void apply_wall_bounceback_kernel(
-    Real* f,
-    const std::uint8_t* node_type,
+__global__ __launch_bounds__(kBlockSize) void apply_wall_bounceback_kernel(
+    Real* LBM_RESTRICT f,
+    const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* sx,
-    const int* sy,
-    const int* sz) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= cell_count || node_type[tid] != kWall) {
@@ -115,6 +117,7 @@ __global__ void apply_wall_bounceback_kernel(
     Real populations[kQ];
     load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, populations);
 
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         // The wall layer is explicit. After the streamed field exists in logical
         // form, swapping q with opp(q) on wall nodes reflects populations back
@@ -124,13 +127,13 @@ __global__ void apply_wall_bounceback_kernel(
     }
 }
 
-__global__ void apply_pressure_boundaries_kernel(
-    Real* f,
-    const std::uint8_t* node_type,
+__global__ __launch_bounds__(kBlockSize) void apply_pressure_boundaries_kernel(
+    Real* LBM_RESTRICT f,
+    const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* sx,
-    const int* sy,
-    const int* sz) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz) {
     const int yz_count = cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= yz_count) {
@@ -156,6 +159,7 @@ __global__ void apply_pressure_boundaries_kernel(
         Real uz_i = Real(0.0);
         recover_macro_from_populations(interior, Real(0.0), Real(0.0), Real(0.0), &rho_i, &ux_i, &uy_i, &uz_i);
 
+        #pragma unroll
         for (int q = 0; q < kQ; ++q) {
             // Non-equilibrium extrapolation is applied to the whole boundary
             // node so the boundary plane is fully refreshed after the streamed
@@ -163,7 +167,8 @@ __global__ void apply_pressure_boundaries_kernel(
             // removed from all boundary populations.
             const Real feq_boundary = equilibrium(q, cfg.rho_inlet, ux_i, uy_i, uz_i);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(
+                f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -177,6 +182,7 @@ __global__ void apply_pressure_boundaries_kernel(
         Real uz_i = Real(0.0);
         recover_macro_from_populations(interior, Real(0.0), Real(0.0), Real(0.0), &rho_i, &ux_i, &uy_i, &uz_i);
 
+        #pragma unroll
         for (int q = 0; q < kQ; ++q) {
             const Real feq_boundary = equilibrium(q, cfg.rho_outlet, ux_i, uy_i, uz_i);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
@@ -186,13 +192,13 @@ __global__ void apply_pressure_boundaries_kernel(
     }
 }
 
-__global__ void apply_velocity_boundaries_kernel(
-    Real* f,
-    const std::uint8_t* node_type,
+__global__ __launch_bounds__(kBlockSize) void apply_velocity_boundaries_kernel(
+    Real* LBM_RESTRICT f,
+    const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* sx,
-    const int* sy,
-    const int* sz) {
+    const int* LBM_RESTRICT sx,
+    const int* LBM_RESTRICT sy,
+    const int* LBM_RESTRICT sz) {
     const int yz_count = cfg.ny * cfg.nz;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= yz_count) {
@@ -223,13 +229,15 @@ __global__ void apply_velocity_boundaries_kernel(
         const Real uz_b = Real(0.0);
         const Real rho_b = rho_i;
 
+        #pragma unroll
         for (int q = 0; q < kQ; ++q) {
             // Rebuild the whole inlet node from the prescribed velocity and the
             // interior non-equilibrium part so the next streamed step sees a
             // self-consistent inlet state.
             const Real feq_boundary = equilibrium(q, rho_b, ux_b, uy_b, uz_b);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(
+                f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -241,6 +249,7 @@ __global__ void apply_velocity_boundaries_kernel(
     load_logical_cell(f, cfg.nx - 2, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior);
 
     if (cfg.outlet_mode == OutletMode::Extrapolation) {
+        #pragma unroll
         for (int q = 0; q < kQ; ++q) {
             // Extrapolation outlet: use the full adjacent interior state on the
             // boundary plane to avoid retaining stale wrapped populations.
@@ -255,6 +264,7 @@ __global__ void apply_velocity_boundaries_kernel(
     Real uz_i = Real(0.0);
     recover_macro_from_populations(interior, Real(0.0), Real(0.0), Real(0.0), &rho_i, &ux_i, &uy_i, &uz_i);
 
+    #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const Real feq_boundary = equilibrium(q, cfg.rho0, ux_i, uy_i, uz_i);
         const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);

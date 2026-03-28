@@ -24,6 +24,14 @@ constexpr Real kCs2 = Real(1.0 / 3.0);
 constexpr Real kInvCs2 = Real(3.0);
 constexpr Real kInvCs4 = Real(9.0);
 
+#if defined(__CUDACC__)
+#define LBM_FORCEINLINE __forceinline__
+#define LBM_RESTRICT __restrict__
+#else
+#define LBM_FORCEINLINE inline
+#define LBM_RESTRICT
+#endif
+
 // The solver keeps one physical distribution storage array of size Q * N.
 // Streaming is expressed purely by changing per-direction logical shifts.
 // A logical access (q, x, y, z) is translated to a physical cell index with
@@ -122,7 +130,7 @@ inline void cuda_check(cudaError_t error, const char* what) {
     }
 }
 
-__host__ __device__ inline int wrap_index(int value, int extent) {
+__host__ __device__ LBM_FORCEINLINE int wrap_index(int value, int extent) {
     value %= extent;
     if (value < 0) {
         value += extent;
@@ -130,16 +138,39 @@ __host__ __device__ inline int wrap_index(int value, int extent) {
     return value;
 }
 
-__host__ __device__ inline int flatten_xyz(int x, int y, int z, int nx, int ny, int nz) {
+// Hot-path helper for periodic-shift addressing. During the simulation, `coord`
+// and `shift` are both already in `[0, extent)`, so only one conditional
+// adjustment is needed and we avoid `%` in the kernels.
+__host__ __device__ LBM_FORCEINLINE int shifted_index(int coord, int shift, int extent) {
+    int value = coord - shift;
+    if (value < 0) {
+        value += extent;
+    }
+    return value;
+}
+
+// Shift updates only advance by one lattice link per step, so the result is at
+// most one period outside the valid range.
+__host__ __device__ LBM_FORCEINLINE int advance_shift_index(int shift, int direction, int extent) {
+    int value = shift + direction;
+    if (value >= extent) {
+        value -= extent;
+    } else if (value < 0) {
+        value += extent;
+    }
+    return value;
+}
+
+__host__ __device__ LBM_FORCEINLINE int flatten_xyz(int x, int y, int z, int nx, int ny, int nz) {
     (void)nz;
     return (z * ny + y) * nx + x;
 }
 
-__host__ __device__ inline int distribution_index(int q, int cell, int cell_count) {
+__host__ __device__ LBM_FORCEINLINE int distribution_index(int q, int cell, int cell_count) {
     return q * cell_count + cell;
 }
 
-__host__ __device__ inline int physical_cell_index(
+__host__ __device__ LBM_FORCEINLINE int physical_cell_index(
     int q,
     int x,
     int y,
@@ -150,17 +181,17 @@ __host__ __device__ inline int physical_cell_index(
     const int* sx,
     const int* sy,
     const int* sz) {
-    const int px = wrap_index(x - sx[q], nx);
-    const int py = wrap_index(y - sy[q], ny);
-    const int pz = wrap_index(z - sz[q], nz);
+    const int px = shifted_index(x, sx[q], nx);
+    const int py = shifted_index(y, sy[q], ny);
+    const int pz = shifted_index(z, sz[q], nz);
     return flatten_xyz(px, py, pz, nx, ny, nz);
 }
 
-__host__ __device__ inline int interior_area(const SimulationConfig& cfg) {
+__host__ __device__ LBM_FORCEINLINE int interior_area(const SimulationConfig& cfg) {
     return (cfg.ny - 2) * (cfg.nz - 2);
 }
 
-__host__ __device__ inline Real prescribed_inlet_velocity_x(int y, int z, const SimulationConfig& cfg) {
+__host__ __device__ LBM_FORCEINLINE Real prescribed_inlet_velocity_x(int y, int z, const SimulationConfig& cfg) {
     if (cfg.inlet_profile == InletProfile::Uniform) {
         return cfg.inlet_velocity;
     }
