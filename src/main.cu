@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -25,6 +26,8 @@ using lbm::StreamwiseMode;
 struct RuntimeOptions {
     std::string output_dir = ".";
     std::string diagnostics_csv = "diagnostics.csv";
+    bool write_cross_sections = false;
+    bool do_not_write_full_volume = false;
 };
 
 struct Diagnostics {
@@ -37,6 +40,32 @@ struct Diagnostics {
     Real residual = Real(0.0);
     Real l2_error = Real(0.0);
     Real balance_metric = Real(0.0);
+    Real mlups_current = Real(0.0);
+    Real mlups_min = Real(0.0);
+    Real mlups_avg = Real(0.0);
+    Real mlups_max = Real(0.0);
+};
+
+struct MlupsStats {
+    using Clock = std::chrono::steady_clock;
+
+    Clock::time_point last_sample_time{};
+    int last_step = 0;
+    double min_mlups = std::numeric_limits<double>::infinity();
+    double max_mlups = 0.0;
+    double total_updates = 0.0;
+    double total_seconds = 0.0;
+    double current_mlups = 0.0;
+    bool armed = false;
+};
+
+struct MemoryReport {
+    std::size_t host_bytes = 0;
+    std::size_t gpu_bytes = 0;
+    std::size_t total_bytes = 0;
+    double host_bytes_per_cell = 0.0;
+    double gpu_bytes_per_cell = 0.0;
+    double total_bytes_per_cell = 0.0;
 };
 
 std::string to_lower(std::string value) {
@@ -64,6 +93,12 @@ std::string profile_name(InletProfile profile) {
     return profile == InletProfile::Uniform ? "uniform" : "parabolic";
 }
 
+std::string format_bytes(std::size_t bytes) {
+    std::ostringstream os;
+    os << bytes << " B (" << std::fixed << std::setprecision(3) << (static_cast<double>(bytes) / (1024.0 * 1024.0)) << " MiB)";
+    return os.str();
+}
+
 [[noreturn]] void usage_and_exit(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n"
@@ -74,6 +109,8 @@ std::string profile_name(InletProfile profile) {
         << "  --rho0 VALUE --rho-inlet VALUE --rho-outlet VALUE\n"
         << "  --inlet-velocity VALUE --inlet-profile uniform|parabolic\n"
         << "  --outlet extrapolation|zero-gauge-pressure\n"
+        << "  --write-cross-sections\n"
+        << "  --do-not-write-full-volume\n"
         << "  --series-terms N --output-dir PATH\n";
     std::exit(0);
 }
@@ -129,6 +166,10 @@ void parse_arguments(int argc, char** argv, SimulationConfig* cfg, RuntimeOption
             cfg->analytical_terms = parse_number<int>(require_value("--series-terms"), "series term count");
         } else if (arg == "--output-dir") {
             runtime->output_dir = require_value("--output-dir");
+        } else if (arg == "--write-cross-sections") {
+            runtime->write_cross_sections = true;
+        } else if (arg == "--do-not-write-full-volume") {
+            runtime->do_not_write_full_volume = true;
         } else if (arg == "--mode") {
             const std::string mode = to_lower(require_value("--mode"));
             if (mode == "a" || mode == "periodic" || mode == "body-force") {
@@ -256,7 +297,8 @@ Diagnostics compute_diagnostics(
     } else {
         const Real q_in = plane_flow_rate(cfg, node_type, ux, 0);
         const Real q_out = plane_flow_rate(cfg, node_type, ux, cfg.nx - 1);
-        diagnostics.balance_metric = std::abs(q_in - q_out) / std::max(std::abs(q_in), Real(1.0e-20));
+        const Real reference_flux = Real(0.5) * (std::abs(q_in) + std::abs(q_out));
+        diagnostics.balance_metric = std::abs(q_in - q_out) / std::max(reference_flux, Real(1.0e-20));
     }
 
     Real l2_num = Real(0.0);
@@ -303,7 +345,9 @@ void print_diagnostics(const Diagnostics& diagnostics, StreamwiseMode mode) {
               << " max_ux=" << diagnostics.max_streamwise_velocity
               << " residual=" << diagnostics.residual
               << " l2=" << diagnostics.l2_error
-              << " balance=" << diagnostics.balance_metric << '\n';
+              << " balance=" << diagnostics.balance_metric
+              << " mlups=" << diagnostics.mlups_current
+              << " mlups[min/avg/max]=" << diagnostics.mlups_min << '/' << diagnostics.mlups_avg << '/' << diagnostics.mlups_max << '\n';
 }
 
 void append_diagnostics_csv(std::ofstream& csv, const Diagnostics& diagnostics) {
@@ -315,7 +359,54 @@ void append_diagnostics_csv(std::ofstream& csv, const Diagnostics& diagnostics) 
         << diagnostics.max_streamwise_velocity << ','
         << diagnostics.residual << ','
         << diagnostics.l2_error << ','
-        << diagnostics.balance_metric << '\n';
+        << diagnostics.balance_metric << ','
+        << diagnostics.mlups_current << ','
+        << diagnostics.mlups_min << ','
+        << diagnostics.mlups_avg << ','
+        << diagnostics.mlups_max << '\n';
+}
+
+void arm_mlups_timer(MlupsStats* mlups, int step) {
+    mlups->last_sample_time = MlupsStats::Clock::now();
+    mlups->last_step = step;
+    mlups->armed = true;
+}
+
+void update_mlups_stats(MlupsStats* mlups, int step, int cell_count, Diagnostics* diagnostics) {
+    if (!mlups->armed) {
+        diagnostics->mlups_current = Real(0.0);
+        diagnostics->mlups_min = Real(0.0);
+        diagnostics->mlups_avg = Real(0.0);
+        diagnostics->mlups_max = Real(0.0);
+        return;
+    }
+
+    const auto now = MlupsStats::Clock::now();
+    const double elapsed_seconds = std::chrono::duration<double>(now - mlups->last_sample_time).count();
+    const int step_delta = step - mlups->last_step;
+    if (step_delta <= 0 || elapsed_seconds <= 0.0) {
+        diagnostics->mlups_current = Real(0.0);
+        diagnostics->mlups_min = std::isfinite(mlups->min_mlups) ? static_cast<Real>(mlups->min_mlups) : Real(0.0);
+        diagnostics->mlups_avg = (mlups->total_seconds > 0.0) ? static_cast<Real>(mlups->total_updates / mlups->total_seconds / 1.0e6) : Real(0.0);
+        diagnostics->mlups_max = static_cast<Real>(mlups->max_mlups);
+        return;
+    }
+
+    const double updates = static_cast<double>(cell_count) * static_cast<double>(step_delta);
+    const double current_mlups = updates / elapsed_seconds / 1.0e6;
+
+    mlups->current_mlups = current_mlups;
+    mlups->min_mlups = std::min(mlups->min_mlups, current_mlups);
+    mlups->max_mlups = std::max(mlups->max_mlups, current_mlups);
+    mlups->total_updates += updates;
+    mlups->total_seconds += elapsed_seconds;
+    mlups->last_sample_time = now;
+    mlups->last_step = step;
+
+    diagnostics->mlups_current = static_cast<Real>(current_mlups);
+    diagnostics->mlups_min = static_cast<Real>(mlups->min_mlups);
+    diagnostics->mlups_avg = static_cast<Real>(mlups->total_updates / mlups->total_seconds / 1.0e6);
+    diagnostics->mlups_max = static_cast<Real>(mlups->max_mlups);
 }
 
 void update_shift_vectors(
@@ -323,13 +414,59 @@ void update_shift_vectors(
     std::array<int, lbm::kQ>* sx,
     std::array<int, lbm::kQ>* sy,
     std::array<int, lbm::kQ>* sz) {
-    // One timestep of streaming is represented only by incrementing the logical
-    // offset of each population by its discrete velocity component.
+    // After collide-and-stream has written into the next logical shift layout,
+    // the host advances the cumulative offsets so all subsequent accesses use
+    // that new streamed state.
     for (int q = 0; q < lbm::kQ; ++q) {
         (*sx)[q] = lbm::wrap_index((*sx)[q] + lbm::kCx[q], cfg.nx);
         (*sy)[q] = lbm::wrap_index((*sy)[q] + lbm::kCy[q], cfg.ny);
         (*sz)[q] = lbm::wrap_index((*sz)[q] + lbm::kCz[q], cfg.nz);
     }
+}
+
+MemoryReport build_memory_report(int cell_count) {
+    MemoryReport report;
+
+    const std::size_t q_field_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cell_count);
+    const std::size_t scalar_field_bytes = sizeof(Real) * static_cast<std::size_t>(cell_count);
+    const std::size_t node_type_bytes = sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count);
+    const std::size_t shift_bytes = sizeof(int) * static_cast<std::size_t>(lbm::kQ);
+
+    // Host-side persistent buffers: node map, four macroscopic output fields,
+    // and the three logical shift vectors stored on the host.
+    report.host_bytes =
+        node_type_bytes +
+        4 * scalar_field_bytes +
+        3 * shift_bytes;
+
+    // GPU-side persistent buffers: one DF storage set, four macro fields used
+    // for diagnostics/output, the node-type field, and the shift vectors.
+    report.gpu_bytes =
+        q_field_bytes +
+        4 * scalar_field_bytes +
+        node_type_bytes +
+        3 * shift_bytes;
+
+    report.total_bytes = report.host_bytes + report.gpu_bytes;
+    report.host_bytes_per_cell = static_cast<double>(report.host_bytes) / static_cast<double>(cell_count);
+    report.gpu_bytes_per_cell = static_cast<double>(report.gpu_bytes) / static_cast<double>(cell_count);
+    report.total_bytes_per_cell = static_cast<double>(report.total_bytes) / static_cast<double>(cell_count);
+    return report;
+}
+
+void print_memory_report(const MemoryReport& report) {
+    std::cout << "Memory demand per simulation"
+              << " host=" << format_bytes(report.host_bytes)
+              << " gpu=" << format_bytes(report.gpu_bytes)
+              << " total=" << format_bytes(report.total_bytes) << '\n';
+
+    std::ostringstream per_cell;
+    per_cell << std::fixed << std::setprecision(3)
+             << "Memory demand per cell"
+             << " host=" << report.host_bytes_per_cell << " B"
+             << " gpu=" << report.gpu_bytes_per_cell << " B"
+             << " total=" << report.total_bytes_per_cell << " B";
+    std::cout << per_cell.str() << '\n';
 }
 
 }  // namespace
@@ -347,6 +484,7 @@ int main(int argc, char** argv) {
 
         const int cell_count = cfg.nx * cfg.ny * cfg.nz;
         const std::size_t field_bytes = sizeof(Real) * static_cast<std::size_t>(cell_count);
+        const MemoryReport memory_report = build_memory_report(cell_count);
 
         Real* d_f = nullptr;
         Real* d_rho = nullptr;
@@ -395,7 +533,10 @@ int main(int argc, char** argv) {
         if (!diagnostics_csv) {
             throw std::runtime_error("Unable to open diagnostics CSV: " + runtime.diagnostics_csv);
         }
-        diagnostics_csv << "step,total_mass,mean_density,bulk_velocity,flow_rate,max_streamwise_velocity,residual,l2_error,balance_metric\n";
+        diagnostics_csv
+            << "step,total_mass,mean_density,bulk_velocity,flow_rate,max_streamwise_velocity,residual,l2_error,balance_metric,mlups_current,mlups_min,mlups_avg,mlups_max\n";
+
+        MlupsStats mlups_stats{};
 
         auto recover_to_host = [&](int step, bool write_output, Real initial_mass, Real* previous_bulk_velocity) {
             lbm::launch_recover_macros(d_f, d_node_type, cfg, d_sx, d_sy, d_sz, d_rho, d_ux, d_uy, d_uz);
@@ -405,15 +546,21 @@ int main(int argc, char** argv) {
             lbm::cuda_check(cudaMemcpy(host_uy.data(), d_uy, field_bytes, cudaMemcpyDeviceToHost), "copy uy to host");
             lbm::cuda_check(cudaMemcpy(host_uz.data(), d_uz, field_bytes, cudaMemcpyDeviceToHost), "copy uz to host");
 
-            const Diagnostics diagnostics = compute_diagnostics(cfg, step, host_node_type, host_rho, host_ux, initial_mass, *previous_bulk_velocity);
+            Diagnostics diagnostics = compute_diagnostics(cfg, step, host_node_type, host_rho, host_ux, initial_mass, *previous_bulk_velocity);
+            update_mlups_stats(&mlups_stats, step, cell_count, &diagnostics);
             print_diagnostics(diagnostics, cfg.mode);
             append_diagnostics_csv(diagnostics_csv, diagnostics);
             *previous_bulk_velocity = diagnostics.bulk_velocity;
 
             if (write_output) {
-                std::ostringstream filename;
-                filename << runtime.output_dir << "/duct_step_" << std::setw(7) << std::setfill('0') << step << ".vti";
-                lbm::write_vti(filename.str(), cfg, host_rho, host_ux, host_uy, host_uz);
+                std::ostringstream stem;
+                stem << runtime.output_dir << "/duct_step_" << std::setw(7) << std::setfill('0') << step;
+                if (!runtime.do_not_write_full_volume) {
+                    lbm::write_vti(stem.str() + ".vti", cfg, host_rho, host_ux, host_uy, host_uz);
+                }
+                if (runtime.write_cross_sections) {
+                    lbm::write_vti_midplane_cross_sections(stem.str(), cfg, host_rho, host_ux, host_uy, host_uz);
+                }
             }
 
             return diagnostics;
@@ -426,19 +573,24 @@ int main(int argc, char** argv) {
                   << " steps=" << cfg.nsteps
                   << " mode=" << mode_name(cfg.mode)
                   << " outlet=" << outlet_name(cfg.outlet_mode)
-                  << " inlet-profile=" << profile_name(cfg.inlet_profile) << '\n';
+                  << " inlet-profile=" << profile_name(cfg.inlet_profile)
+                  << " cross-sections=" << (runtime.write_cross_sections ? "on" : "off")
+                  << " do-not-write-full-volume=" << (runtime.do_not_write_full_volume ? "on" : "off")
+                  << '\n';
+        print_memory_report(memory_report);
 
         Real previous_bulk_velocity = Real(0.0);
         const Diagnostics initial_diagnostics = recover_to_host(0, true, Real(0.0), &previous_bulk_velocity);
         const Real initial_mass = initial_diagnostics.total_mass;
+        arm_mlups_timer(&mlups_stats, 0);
+        Diagnostics latest_diagnostics = initial_diagnostics;
 
         for (int step = 1; step <= cfg.nsteps; ++step) {
+            lbm::launch_collide_and_stream(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
             update_shift_vectors(cfg, &shift_x, &shift_y, &shift_z);
             lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update x shifts");
             lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update y shifts");
             lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update z shifts");
-
-            lbm::launch_collide_and_stream(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
             // Boundary reconstruction always runs after the streamed field exists
             // in logical form at the current shift state.
             lbm::launch_apply_wall_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
@@ -451,9 +603,15 @@ int main(int argc, char** argv) {
             const bool write_output = (cfg.output_every > 0) && (step % cfg.output_every == 0 || step == cfg.nsteps);
             const bool print_diagnostics = (cfg.diagnostic_every > 0) && (step % cfg.diagnostic_every == 0 || step == cfg.nsteps);
             if (write_output || print_diagnostics) {
-                recover_to_host(step, write_output, initial_mass, &previous_bulk_velocity);
+                lbm::cuda_check(cudaDeviceSynchronize(), "synchronize timestep before diagnostics");
+                latest_diagnostics = recover_to_host(step, write_output, initial_mass, &previous_bulk_velocity);
             }
         }
+
+        std::cout << "MLUPS summary"
+                  << " min=" << latest_diagnostics.mlups_min
+                  << " avg=" << latest_diagnostics.mlups_avg
+                  << " max=" << latest_diagnostics.mlups_max << '\n';
 
         lbm::cuda_check(cudaFree(d_f), "free DF field");
         lbm::cuda_check(cudaFree(d_rho), "free rho field");

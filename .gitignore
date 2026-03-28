@@ -4,3 +4,6 @@ build/
 .vscode/
 *.md
 .old\
+build_*/
+*.csv
+smoke_*/

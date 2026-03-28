@@ -137,13 +137,13 @@ __global__ void apply_pressure_boundaries_kernel(
         recover_macro_from_populations(interior, Real(0.0), Real(0.0), Real(0.0), &rho_i, &ux_i, &uy_i, &uz_i);
 
         for (int q = 0; q < kQ; ++q) {
-            if (g_cx[q] > 0) {
-                // At x = 0 the unknown populations are the ones that would have
-                // streamed from x < 0, i.e. directions with positive cx.
-                const Real feq_boundary = equilibrium(q, cfg.rho_inlet, ux_i, uy_i, uz_i);
-                const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-                store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
-            }
+            // Non-equilibrium extrapolation is applied to the whole boundary
+            // node so the boundary plane is fully refreshed after the streamed
+            // step and periodic wrap contamination in the incoming set is
+            // removed from all boundary populations.
+            const Real feq_boundary = equilibrium(q, cfg.rho_inlet, ux_i, uy_i, uz_i);
+            const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
+            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -158,14 +158,10 @@ __global__ void apply_pressure_boundaries_kernel(
         recover_macro_from_populations(interior, Real(0.0), Real(0.0), Real(0.0), &rho_i, &ux_i, &uy_i, &uz_i);
 
         for (int q = 0; q < kQ; ++q) {
-            if (g_cx[q] < 0) {
-                // At x = nx - 1 the unknown populations are the ones incoming from
-                // x > nx - 1, i.e. directions with negative cx.
-                const Real feq_boundary = equilibrium(q, cfg.rho_outlet, ux_i, uy_i, uz_i);
-                const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-                store_logical_population(
-                    f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
-            }
+            const Real feq_boundary = equilibrium(q, cfg.rho_outlet, ux_i, uy_i, uz_i);
+            const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
+            store_logical_population(
+                f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 }
@@ -208,13 +204,12 @@ __global__ void apply_velocity_boundaries_kernel(
         const Real rho_b = rho_i;
 
         for (int q = 0; q < kQ; ++q) {
-            if (g_cx[q] > 0) {
-                // Velocity inlet: prescribe u and reconstruct only incoming
-                // populations with a local non-equilibrium extrapolation rule.
-                const Real feq_boundary = equilibrium(q, rho_b, ux_b, uy_b, uz_b);
-                const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-                store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
-            }
+            // Rebuild the whole inlet node from the prescribed velocity and the
+            // interior non-equilibrium part so the next streamed step sees a
+            // self-consistent inlet state.
+            const Real feq_boundary = equilibrium(q, rho_b, ux_b, uy_b, uz_b);
+            const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
+            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -227,12 +222,9 @@ __global__ void apply_velocity_boundaries_kernel(
 
     if (cfg.outlet_mode == OutletMode::Extrapolation) {
         for (int q = 0; q < kQ; ++q) {
-            if (g_cx[q] < 0) {
-                // Extrapolation outlet: incoming populations are copied from the
-                // neighbouring interior plane, while already-known outgoing
-                // populations remain untouched.
-                store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior[q]);
-            }
+            // Extrapolation outlet: use the full adjacent interior state on the
+            // boundary plane to avoid retaining stale wrapped populations.
+            store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior[q]);
         }
         return;
     }
@@ -244,14 +236,10 @@ __global__ void apply_velocity_boundaries_kernel(
     recover_macro_from_populations(interior, Real(0.0), Real(0.0), Real(0.0), &rho_i, &ux_i, &uy_i, &uz_i);
 
     for (int q = 0; q < kQ; ++q) {
-        if (g_cx[q] < 0) {
-            // Zero-gauge-pressure outlet: density is pinned to rho0 and the
-            // interior non-equilibrium part is preserved on incoming directions.
-            const Real feq_boundary = equilibrium(q, cfg.rho0, ux_i, uy_i, uz_i);
-            const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(
-                f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
-        }
+        const Real feq_boundary = equilibrium(q, cfg.rho0, ux_i, uy_i, uz_i);
+        const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
+        store_logical_population(
+            f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
     }
 }
 

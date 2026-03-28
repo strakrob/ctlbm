@@ -23,15 +23,8 @@ def main() -> int:
         return 1
 
     last = rows[-1]
-    print(f"step: {last['step']}")
-    print(f"total_mass: {last['total_mass']}")
-    print(f"mean_density: {last['mean_density']}")
-    print(f"bulk_velocity: {last['bulk_velocity']}")
-    print(f"flow_rate: {last['flow_rate']}")
-    print(f"max_streamwise_velocity: {last['max_streamwise_velocity']}")
-    print(f"residual: {last['residual']}")
-    print(f"l2_error: {last['l2_error']}")
-    print(f"balance_metric: {last['balance_metric']}")
+    for key, value in last.items():
+        print(f"{key}: {value}")
     return 0
 
 

@@ -72,9 +72,7 @@ The streamwise mode is selected at runtime with `--mode`.
 - non-periodic `x`,
 - inlet density `--rho-inlet`,
 - outlet density `--rho-outlet`,
-- incoming populations at `x = 0` and `x = Nx - 1` are reconstructed with a local non-equilibrium extrapolation rule.
-
-For the inlet plane the unknown set is `cx > 0`. For the outlet plane the unknown set is `cx < 0`.
+- the full inlet and outlet boundary nodes are refreshed with a local non-equilibrium extrapolation rule built from the adjacent interior state and the target boundary density.
 
 ### Mode C
 
@@ -87,7 +85,7 @@ For the inlet plane the unknown set is `cx > 0`. For the outlet plane the unknow
 Implemented outlet variants:
 
 - `extrapolation`: incoming outlet populations (`cx < 0`) are copied from the adjacent interior plane.
-- `zero-gauge-pressure`: incoming outlet populations are reconstructed with `rho = rho0`.
+- `zero-gauge-pressure`: the outlet node is reconstructed with `rho = rho0` and the interior non-equilibrium part.
 
 ## Boundary ordering
 
@@ -124,6 +122,9 @@ Show options:
 ```bash
 ./build/lbmd3q27 --help
 ```
+
+Add `--write-cross-sections` to emit midpoint `xy`, `xz`, and `yz` slice files
+alongside the standard 3D snapshot.
 
 ### Mode A example
 
@@ -179,6 +180,12 @@ The solver writes:
 - ...
 - `diagnostics.csv`.
 
+With `--write-cross-sections`, each snapshot also writes:
+
+- `duct_step_0001000_xy.vti` at `z = Nz / 2`,
+- `duct_step_0001000_xz.vti` at `y = Ny / 2`,
+- `duct_step_0001000_yz.vti` at `x = Nx / 2`.
+
 The `.vti` files contain:
 
 - `rho`,
@@ -193,6 +200,7 @@ Open them directly in ParaView as `ImageData`.
 
 Console output and `diagnostics.csv` report:
 
+- persistent memory demand on host, GPU, and combined, both per simulation and per cell,
 - total mass,
 - mean density,
 - bulk velocity on a representative interior plane,
@@ -200,7 +208,8 @@ Console output and `diagnostics.csv` report:
 - maximum streamwise velocity,
 - residual as the change in bulk velocity between samples,
 - `L2` error,
-- `balance` metric.
+- `balance` metric,
+- MLUPS throughput statistics.
 
 Validation metric details:
 
@@ -212,6 +221,13 @@ Balance metric details:
 
 - Mode A: relative total-mass drift against the initial state.
 - Mode B / C: relative inlet/outlet flow-rate mismatch.
+
+MLUPS metric details:
+
+- `mlups_current`: throughput over the last measured timestep interval between diagnostic samples,
+- `mlups_min`: minimum measured interval throughput so far,
+- `mlups_avg`: average throughput based on total measured lattice updates divided by total measured wall time,
+- `mlups_max`: maximum measured interval throughput so far.
 
 Summarize the last recorded diagnostic row:
 

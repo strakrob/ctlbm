@@ -165,26 +165,13 @@ __global__ void collide_and_stream_kernel(
     const int y = yz % cfg.ny;
     const int z = yz / cfg.ny;
 
-    // The host has already advanced the shift vectors to the state that represents
-    // t + 1. To read the logical field at time t, the kernel subtracts one lattice
-    // velocity from each cumulative shift. That makes the single-array streaming
-    // rule explicit in code: read via previous shifts, write via current shifts.
-    int previous_sx[kQ];
-    int previous_sy[kQ];
-    int previous_sz[kQ];
-    for (int q = 0; q < kQ; ++q) {
-        previous_sx[q] = wrap_index(current_sx[q] - g_cx[q], cfg.nx);
-        previous_sy[q] = wrap_index(current_sy[q] - g_cy[q], cfg.ny);
-        previous_sz[q] = wrap_index(current_sz[q] - g_cz[q], cfg.nz);
-    }
-
     Real populations[kQ];
-    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, previous_sx, previous_sy, previous_sz, populations);
+    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz, populations);
 
-    if (node_type[tid] == kWall) {
-        // Wall cells are overwritten by the bounce-back kernel after streaming.
-        // Here we only carry the distributions forward so boundary handling can
-        // operate on the current logical field in place.
+    if (node_type[tid] != kFluid) {
+        // Walls and explicit inlet/outlet planes are not collided as ordinary
+        // fluid nodes. They are carried forward into the new logical shift
+        // state and then overwritten by dedicated boundary kernels.
         for (int q = 0; q < kQ; ++q) {
             const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
             f[distribution_index(q, dst, cell_count)] = populations[q];
@@ -206,8 +193,10 @@ __global__ void collide_and_stream_kernel(
         const Real feq = equilibrium(q, rho, ux, uy, uz);
         const Real force_term = guo_force_term(q, ux, uy, uz, fx, fy, fz, cfg.omega);
         const Real post_collision = populations[q] - cfg.omega * (populations[q] - feq) + force_term;
-        // Writing through the current shift arrays realizes the streamed field at
-        // time t + 1 without a destination DF buffer.
+        // In periodic-shift streaming the post-collision value stays in the
+        // current physical slot. The host advances the logical shifts after the
+        // kernel, which makes the next logical access observe the streamed
+        // neighbour without a second DF array.
         const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
         f[distribution_index(q, dst, cell_count)] = post_collision;
     }

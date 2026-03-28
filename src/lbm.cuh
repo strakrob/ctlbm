@@ -226,5 +226,12 @@ void write_vti(
     const std::vector<Real>& ux,
     const std::vector<Real>& uy,
     const std::vector<Real>& uz);
+void write_vti_midplane_cross_sections(
+    const std::string& output_stem,
+    const SimulationConfig& cfg,
+    const std::vector<Real>& rho,
+    const std::vector<Real>& ux,
+    const std::vector<Real>& uy,
+    const std::vector<Real>& uz);
 
 }  // namespace lbm
