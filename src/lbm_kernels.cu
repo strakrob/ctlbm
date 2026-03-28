@@ -10,6 +10,64 @@ __device__ __constant__ Real g_w[kQ];
 
 namespace {
 
+__host__ inline void volume_launch_config(const SimulationConfig& cfg, dim3* grid, dim3* block) {
+#if defined(LBM_USE_3D_TOPOLOGY)
+    if (cfg.nx <= 0 || cfg.nx > kCudaMaxThreadsPerBlock) {
+        throw std::runtime_error("LBM_USE_3D_TOPOLOGY requires nx in [1, 1024].");
+    }
+    *block = dim3(static_cast<unsigned int>(cfg.nx), 1u, 1u);
+    *grid = dim3(static_cast<unsigned int>(cfg.ny), static_cast<unsigned int>(cfg.nz), 1u);
+#else
+    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    const int blocks_1d = (cell_count + kBlockSize - 1) / kBlockSize;
+    *block = dim3(static_cast<unsigned int>(kBlockSize), 1u, 1u);
+    *grid = dim3(static_cast<unsigned int>(blocks_1d), 1u, 1u);
+#endif
+}
+
+__device__ LBM_FORCEINLINE bool volume_thread_coordinates(
+    const SimulationConfig& cfg,
+    int* tid,
+    int* x,
+    int* y,
+    int* z) {
+#if defined(LBM_USE_3D_TOPOLOGY)
+    *x = static_cast<int>(threadIdx.x);
+    *y = static_cast<int>(blockIdx.x);
+    *z = static_cast<int>(blockIdx.y);
+    if (*x >= cfg.nx || *y >= cfg.ny || *z >= cfg.nz) {
+        return false;
+    }
+    *tid = LBM_FLATTEN_XYZ(*x, *y, *z, cfg.nx, cfg.ny, cfg.nz);
+    return true;
+#else
+    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    *tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+    if (*tid >= cell_count) {
+        return false;
+    }
+    *x = *tid % cfg.nx;
+    const int yz = *tid / cfg.nx;
+    *y = yz % cfg.ny;
+    *z = yz / cfg.ny;
+    return true;
+#endif
+}
+
+__device__ LBM_FORCEINLINE void load_shift_vectors_to_shared(
+    const int* LBM_RESTRICT src_x,
+    const int* LBM_RESTRICT src_y,
+    const int* LBM_RESTRICT src_z,
+    int* LBM_RESTRICT dst_x,
+    int* LBM_RESTRICT dst_y,
+    int* LBM_RESTRICT dst_z) {
+    for (int q = static_cast<int>(threadIdx.x); q < kQ; q += static_cast<int>(blockDim.x)) {
+        dst_x[q] = src_x[q];
+        dst_y[q] = src_y[q];
+        dst_z[q] = src_z[q];
+    }
+}
+
 __device__ LBM_FORCEINLINE Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
     const Real uu = ux * ux + uy * uy + uz * uz;
@@ -46,7 +104,7 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     for (int q = 0; q < kQ; ++q) {
         // The logical field for direction q is stored with its own running shift.
         const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-        populations[q] = f[distribution_index(q, cell, cell_count)];
+        populations[q] = f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)];
     }
 }
 
@@ -79,17 +137,14 @@ __device__ LBM_FORCEINLINE void recover_macro_from_populations(
     *uz = (mz + Real(0.5) * force_z) / density;
 }
 
-__global__ __launch_bounds__(kBlockSize) void classify_nodes_kernel(std::uint8_t* LBM_RESTRICT node_type, SimulationConfig cfg) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= cell_count) {
+__global__ __launch_bounds__(kLaunchBounds) void classify_nodes_kernel(std::uint8_t* LBM_RESTRICT node_type, SimulationConfig cfg) {
+    int tid = 0;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    if (!volume_thread_coordinates(cfg, &tid, &x, &y, &z)) {
         return;
     }
-
-    const int x = tid % cfg.nx;
-    const int yz = tid / cfg.nx;
-    const int y = yz % cfg.ny;
-    const int z = yz / cfg.ny;
 
     if (y == 0 || y == cfg.ny - 1 || z == 0 || z == cfg.nz - 1) {
         node_type[tid] = kWall;
@@ -110,7 +165,7 @@ __global__ __launch_bounds__(kBlockSize) void classify_nodes_kernel(std::uint8_t
     }
 }
 
-__global__ __launch_bounds__(kBlockSize) void initialize_equilibrium_kernel(
+__global__ __launch_bounds__(kLaunchBounds) void initialize_equilibrium_kernel(
     Real* LBM_RESTRICT f,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
@@ -118,15 +173,13 @@ __global__ __launch_bounds__(kBlockSize) void initialize_equilibrium_kernel(
     const int* LBM_RESTRICT sy,
     const int* LBM_RESTRICT sz) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= cell_count) {
+    int tid = 0;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    if (!volume_thread_coordinates(cfg, &tid, &x, &y, &z)) {
         return;
     }
-
-    const int x = tid % cfg.nx;
-    const int yz = tid / cfg.nx;
-    const int y = yz % cfg.ny;
-    const int z = yz / cfg.ny;
 
     // Boundary planes start from their target state so the first few steps do not
     // begin from a strongly inconsistent inlet or outlet field.
@@ -146,30 +199,37 @@ __global__ __launch_bounds__(kBlockSize) void initialize_equilibrium_kernel(
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const int cell = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz);
-        f[distribution_index(q, cell, cell_count)] = equilibrium(q, rho, ux, uy, uz);
+        f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)] = equilibrium(q, rho, ux, uy, uz);
     }
 }
 
-__global__ __launch_bounds__(kBlockSize) void collide_and_stream_kernel(
+__global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     Real* LBM_RESTRICT f,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
     const int* LBM_RESTRICT current_sx,
     const int* LBM_RESTRICT current_sy,
     const int* LBM_RESTRICT current_sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= cell_count) {
+    __shared__ int shared_sx[kQ];
+    __shared__ int shared_sy[kQ];
+    __shared__ int shared_sz[kQ];
+    load_shift_vectors_to_shared(current_sx, current_sy, current_sz, shared_sx, shared_sy, shared_sz);
+    __syncthreads();
+
+    const int nx = cfg.nx;
+    const int ny = cfg.ny;
+    const int nz = cfg.nz;
+    const int cell_count = nx * ny * nz;
+    int tid = 0;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    if (!volume_thread_coordinates(cfg, &tid, &x, &y, &z)) {
         return;
     }
 
-    const int x = tid % cfg.nx;
-    const int yz = tid / cfg.nx;
-    const int y = yz % cfg.ny;
-    const int z = yz / cfg.ny;
-
     Real populations[kQ];
-    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz, populations);
+    load_logical_cell(f, x, y, z, nx, ny, nz, shared_sx, shared_sy, shared_sz, populations);
 
     const std::uint8_t type = node_type[tid];
 
@@ -179,8 +239,8 @@ __global__ __launch_bounds__(kBlockSize) void collide_and_stream_kernel(
         // state and then overwritten by dedicated boundary kernels.
         #pragma unroll
         for (int q = 0; q < kQ; ++q) {
-            const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
-            f[distribution_index(q, dst, cell_count)] = populations[q];
+            const int dst = physical_cell_index(q, x, y, z, nx, ny, nz, shared_sx, shared_sy, shared_sz);
+            f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = populations[q];
         }
         return;
     }
@@ -204,12 +264,12 @@ __global__ __launch_bounds__(kBlockSize) void collide_and_stream_kernel(
         // current physical slot. The host advances the logical shifts after the
         // kernel, which makes the next logical access observe the streamed
         // neighbour without a second DF array.
-        const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
-        f[distribution_index(q, dst, cell_count)] = post_collision;
+        const int dst = physical_cell_index(q, x, y, z, nx, ny, nz, shared_sx, shared_sy, shared_sz);
+        f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = post_collision;
     }
 }
 
-__global__ __launch_bounds__(kBlockSize) void recover_macros_kernel(
+__global__ __launch_bounds__(kLaunchBounds) void recover_macros_kernel(
     const Real* LBM_RESTRICT f,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
@@ -220,16 +280,13 @@ __global__ __launch_bounds__(kBlockSize) void recover_macros_kernel(
     Real* LBM_RESTRICT ux,
     Real* LBM_RESTRICT uy,
     Real* LBM_RESTRICT uz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= cell_count) {
+    int tid = 0;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    if (!volume_thread_coordinates(cfg, &tid, &x, &y, &z)) {
         return;
     }
-
-    const int x = tid % cfg.nx;
-    const int yz = tid / cfg.nx;
-    const int y = yz % cfg.ny;
-    const int z = yz / cfg.ny;
 
     Real populations[kQ];
     load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, populations);
@@ -260,9 +317,10 @@ void copy_lattice_constants_to_device() {
 }
 
 void launch_classify_nodes(std::uint8_t* d_node_type, const SimulationConfig& cfg) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int blocks = (cell_count + kBlockSize - 1) / kBlockSize;
-    classify_nodes_kernel<<<blocks, kBlockSize>>>(d_node_type, cfg);
+    dim3 grid{};
+    dim3 block{};
+    volume_launch_config(cfg, &grid, &block);
+    classify_nodes_kernel<<<grid, block>>>(d_node_type, cfg);
     cuda_check(cudaGetLastError(), "launch classify_nodes_kernel");
 }
 
@@ -273,9 +331,10 @@ void launch_initialize_equilibrium(
     const int* d_sx,
     const int* d_sy,
     const int* d_sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int blocks = (cell_count + kBlockSize - 1) / kBlockSize;
-    initialize_equilibrium_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    dim3 grid{};
+    dim3 block{};
+    volume_launch_config(cfg, &grid, &block);
+    initialize_equilibrium_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
     cuda_check(cudaGetLastError(), "launch initialize_equilibrium_kernel");
 }
 
@@ -286,9 +345,10 @@ void launch_collide_and_stream(
     const int* d_sx,
     const int* d_sy,
     const int* d_sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int blocks = (cell_count + kBlockSize - 1) / kBlockSize;
-    collide_and_stream_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    dim3 grid{};
+    dim3 block{};
+    volume_launch_config(cfg, &grid, &block);
+    collide_and_stream_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
     cuda_check(cudaGetLastError(), "launch collide_and_stream_kernel");
 }
 
@@ -303,9 +363,10 @@ void launch_recover_macros(
     Real* d_ux,
     Real* d_uy,
     Real* d_uz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int blocks = (cell_count + kBlockSize - 1) / kBlockSize;
-    recover_macros_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz, d_rho, d_ux, d_uy, d_uz);
+    dim3 grid{};
+    dim3 block{};
+    volume_launch_config(cfg, &grid, &block);
+    recover_macros_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz, d_rho, d_ux, d_uy, d_uz);
     cuda_check(cudaGetLastError(), "launch recover_macros_kernel");
 }
 

@@ -7,6 +7,88 @@ namespace lbm {
 
 namespace {
 
+__host__ inline void wall_launch_config(const SimulationConfig& cfg, dim3* grid, dim3* block) {
+#if defined(LBM_USE_3D_TOPOLOGY)
+    if (cfg.nx <= 0 || cfg.nx > kCudaMaxThreadsPerBlock) {
+        throw std::runtime_error("LBM_USE_3D_TOPOLOGY requires nx in [1, 1024] for wall kernels.");
+    }
+    *block = dim3(static_cast<unsigned int>(cfg.nx), 1u, 1u);
+    *grid = dim3(static_cast<unsigned int>(cfg.ny), static_cast<unsigned int>(cfg.nz), 1u);
+#else
+    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    const int blocks_1d = (cell_count + kBlockSize - 1) / kBlockSize;
+    *block = dim3(static_cast<unsigned int>(kBlockSize), 1u, 1u);
+    *grid = dim3(static_cast<unsigned int>(blocks_1d), 1u, 1u);
+#endif
+}
+
+__host__ inline void yz_launch_config(const SimulationConfig& cfg, dim3* grid, dim3* block) {
+#if defined(LBM_USE_3D_TOPOLOGY)
+    if (cfg.ny <= 0 || cfg.ny > kCudaMaxThreadsPerBlock) {
+        throw std::runtime_error("LBM_USE_3D_TOPOLOGY requires ny in [1, 1024] for yz-plane kernels.");
+    }
+    *block = dim3(static_cast<unsigned int>(cfg.ny), 1u, 1u);
+    *grid = dim3(static_cast<unsigned int>(cfg.nz), 1u, 1u);
+#else
+    const int yz_count = cfg.ny * cfg.nz;
+    const int blocks_1d = (yz_count + kBlockSize - 1) / kBlockSize;
+    *block = dim3(static_cast<unsigned int>(kBlockSize), 1u, 1u);
+    *grid = dim3(static_cast<unsigned int>(blocks_1d), 1u, 1u);
+#endif
+}
+
+__device__ LBM_FORCEINLINE bool wall_thread_coordinates(
+    const SimulationConfig& cfg,
+    int* tid,
+    int* x,
+    int* y,
+    int* z) {
+#if defined(LBM_USE_3D_TOPOLOGY)
+    *x = static_cast<int>(threadIdx.x);
+    *y = static_cast<int>(blockIdx.x);
+    *z = static_cast<int>(blockIdx.y);
+    if (*x >= cfg.nx || *y >= cfg.ny || *z >= cfg.nz) {
+        return false;
+    }
+    *tid = LBM_FLATTEN_XYZ(*x, *y, *z, cfg.nx, cfg.ny, cfg.nz);
+    return true;
+#else
+    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    *tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+    if (*tid >= cell_count) {
+        return false;
+    }
+    *x = *tid % cfg.nx;
+    const int yz = *tid / cfg.nx;
+    *y = yz % cfg.ny;
+    *z = yz / cfg.ny;
+    return true;
+#endif
+}
+
+__device__ LBM_FORCEINLINE bool yz_thread_coordinates(
+    const SimulationConfig& cfg,
+    int* y,
+    int* z) {
+#if defined(LBM_USE_3D_TOPOLOGY)
+    *y = static_cast<int>(threadIdx.x);
+    *z = static_cast<int>(blockIdx.x);
+    if (*y >= cfg.ny || *z >= cfg.nz) {
+        return false;
+    }
+    return true;
+#else
+    const int yz_count = cfg.ny * cfg.nz;
+    const int tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+    if (tid >= yz_count) {
+        return false;
+    }
+    *y = tid % cfg.ny;
+    *z = tid / cfg.ny;
+    return true;
+#endif
+}
+
 inline int clamp_index(int value, int lo, int hi) {
     return value < lo ? lo : (value > hi ? hi : value);
 }
@@ -46,7 +128,7 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-        populations[q] = f[distribution_index(q, cell, cell_count)];
+        populations[q] = f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)];
     }
 }
 
@@ -65,7 +147,7 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     Real value) {
     const int cell_count = nx * ny * nz;
     const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-    f[distribution_index(q, cell, cell_count)] = value;
+    f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)] = value;
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(
@@ -96,7 +178,7 @@ __device__ LBM_FORCEINLINE void recover_macro_from_populations(
     *uz = (mz + Real(0.5) * force_z) / density;
 }
 
-__global__ __launch_bounds__(kBlockSize) void apply_wall_bounceback_kernel(
+__global__ __launch_bounds__(kLaunchBounds) void apply_wall_bounceback_kernel(
     Real* LBM_RESTRICT f,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
@@ -104,15 +186,16 @@ __global__ __launch_bounds__(kBlockSize) void apply_wall_bounceback_kernel(
     const int* LBM_RESTRICT sy,
     const int* LBM_RESTRICT sz) {
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= cell_count || node_type[tid] != kWall) {
+    int tid = 0;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    if (!wall_thread_coordinates(cfg, &tid, &x, &y, &z)) {
         return;
     }
-
-    const int x = tid % cfg.nx;
-    const int yz = tid / cfg.nx;
-    const int y = yz % cfg.ny;
-    const int z = yz / cfg.ny;
+    if (node_type[tid] != kWall) {
+        return;
+    }
 
     Real populations[kQ];
     load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, populations);
@@ -123,31 +206,28 @@ __global__ __launch_bounds__(kBlockSize) void apply_wall_bounceback_kernel(
         // form, swapping q with opp(q) on wall nodes reflects populations back
         // toward adjacent fluid nodes using the same single DF storage.
         const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz);
-        f[distribution_index(q, dst, cell_count)] = populations[g_opp[q]];
+        f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = populations[g_opp[q]];
     }
 }
 
-__global__ __launch_bounds__(kBlockSize) void apply_pressure_boundaries_kernel(
+__global__ __launch_bounds__(kLaunchBounds) void apply_pressure_boundaries_kernel(
     Real* LBM_RESTRICT f,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
     const int* LBM_RESTRICT sx,
     const int* LBM_RESTRICT sy,
     const int* LBM_RESTRICT sz) {
-    const int yz_count = cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= yz_count) {
+    int y = 0;
+    int z = 0;
+    if (!yz_thread_coordinates(cfg, &y, &z)) {
         return;
     }
-
-    const int y = tid % cfg.ny;
-    const int z = tid / cfg.ny;
     if (y == 0 || y == cfg.ny - 1 || z == 0 || z == cfg.nz - 1) {
         return;
     }
 
-    const int inlet_tid = flatten_xyz(0, y, z, cfg.nx, cfg.ny, cfg.nz);
-    const int outlet_tid = flatten_xyz(cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz);
+    const int inlet_tid = LBM_FLATTEN_XYZ(0, y, z, cfg.nx, cfg.ny, cfg.nz);
+    const int outlet_tid = LBM_FLATTEN_XYZ(cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz);
 
     if (node_type[inlet_tid] == kInlet) {
         Real interior[kQ];
@@ -167,8 +247,7 @@ __global__ __launch_bounds__(kBlockSize) void apply_pressure_boundaries_kernel(
             // removed from all boundary populations.
             const Real feq_boundary = equilibrium(q, cfg.rho_inlet, ux_i, uy_i, uz_i);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(
-                f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -186,33 +265,29 @@ __global__ __launch_bounds__(kBlockSize) void apply_pressure_boundaries_kernel(
         for (int q = 0; q < kQ; ++q) {
             const Real feq_boundary = equilibrium(q, cfg.rho_outlet, ux_i, uy_i, uz_i);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(
-                f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 }
 
-__global__ __launch_bounds__(kBlockSize) void apply_velocity_boundaries_kernel(
+__global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kernel(
     Real* LBM_RESTRICT f,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
     const int* LBM_RESTRICT sx,
     const int* LBM_RESTRICT sy,
     const int* LBM_RESTRICT sz) {
-    const int yz_count = cfg.ny * cfg.nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= yz_count) {
+    int y = 0;
+    int z = 0;
+    if (!yz_thread_coordinates(cfg, &y, &z)) {
         return;
     }
-
-    const int y = tid % cfg.ny;
-    const int z = tid / cfg.ny;
     if (y == 0 || y == cfg.ny - 1 || z == 0 || z == cfg.nz - 1) {
         return;
     }
 
-    const int inlet_tid = flatten_xyz(0, y, z, cfg.nx, cfg.ny, cfg.nz);
-    const int outlet_tid = flatten_xyz(cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz);
+    const int inlet_tid = LBM_FLATTEN_XYZ(0, y, z, cfg.nx, cfg.ny, cfg.nz);
+    const int outlet_tid = LBM_FLATTEN_XYZ(cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz);
 
     if (node_type[inlet_tid] == kInlet) {
         Real interior[kQ];
@@ -236,8 +311,7 @@ __global__ __launch_bounds__(kBlockSize) void apply_velocity_boundaries_kernel(
             // self-consistent inlet state.
             const Real feq_boundary = equilibrium(q, rho_b, ux_b, uy_b, uz_b);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(
-                f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -268,8 +342,7 @@ __global__ __launch_bounds__(kBlockSize) void apply_velocity_boundaries_kernel(
     for (int q = 0; q < kQ; ++q) {
         const Real feq_boundary = equilibrium(q, cfg.rho0, ux_i, uy_i, uz_i);
         const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-        store_logical_population(
-            f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+        store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
     }
 }
 
@@ -282,9 +355,10 @@ void launch_apply_wall_boundaries(
     const int* d_sx,
     const int* d_sy,
     const int* d_sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
-    const int blocks = (cell_count + kBlockSize - 1) / kBlockSize;
-    apply_wall_bounceback_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    dim3 grid{};
+    dim3 block{};
+    wall_launch_config(cfg, &grid, &block);
+    apply_wall_bounceback_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
     cuda_check(cudaGetLastError(), "launch apply_wall_bounceback_kernel");
 }
 
@@ -295,9 +369,10 @@ void launch_apply_pressure_boundaries(
     const int* d_sx,
     const int* d_sy,
     const int* d_sz) {
-    const int yz_count = cfg.ny * cfg.nz;
-    const int blocks = (yz_count + kBlockSize - 1) / kBlockSize;
-    apply_pressure_boundaries_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    dim3 grid{};
+    dim3 block{};
+    yz_launch_config(cfg, &grid, &block);
+    apply_pressure_boundaries_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
     cuda_check(cudaGetLastError(), "launch apply_pressure_boundaries_kernel");
 }
 
@@ -308,9 +383,10 @@ void launch_apply_velocity_boundaries(
     const int* d_sx,
     const int* d_sy,
     const int* d_sz) {
-    const int yz_count = cfg.ny * cfg.nz;
-    const int blocks = (yz_count + kBlockSize - 1) / kBlockSize;
-    apply_velocity_boundaries_kernel<<<blocks, kBlockSize>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    dim3 grid{};
+    dim3 block{};
+    yz_launch_config(cfg, &grid, &block);
+    apply_velocity_boundaries_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
     cuda_check(cudaGetLastError(), "launch apply_velocity_boundaries_kernel");
 }
 

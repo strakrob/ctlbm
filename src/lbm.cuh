@@ -19,7 +19,17 @@ inline constexpr const char* kVtiScalarType = "Float64";
 #endif
 
 constexpr int kQ = 27;
+#ifdef LBM_USE_FLOAT
+constexpr int kBlockSize = 64;
+#else
 constexpr int kBlockSize = 128;
+#endif
+#ifdef LBM_USE_3D_TOPOLOGY
+constexpr int kLaunchBounds = 1024;
+#else
+constexpr int kLaunchBounds = kBlockSize;
+#endif
+constexpr int kCudaMaxThreadsPerBlock = 1024;
 constexpr Real kCs2 = Real(1.0 / 3.0);
 constexpr Real kInvCs2 = Real(3.0);
 constexpr Real kInvCs4 = Real(9.0);
@@ -31,6 +41,9 @@ constexpr Real kInvCs4 = Real(9.0);
 #define LBM_FORCEINLINE inline
 #define LBM_RESTRICT
 #endif
+
+#define LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz) ((((z) * (ny)) + (y)) * (nx) + (x))
+#define LBM_DISTRIBUTION_INDEX(q, cell, cell_count) ((q) * (cell_count) + (cell))
 
 // The solver keeps one physical distribution storage array of size Q * N.
 // Streaming is expressed purely by changing per-direction logical shifts.
@@ -162,12 +175,11 @@ __host__ __device__ LBM_FORCEINLINE int advance_shift_index(int shift, int direc
 }
 
 __host__ __device__ LBM_FORCEINLINE int flatten_xyz(int x, int y, int z, int nx, int ny, int nz) {
-    (void)nz;
-    return (z * ny + y) * nx + x;
+    return LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
 }
 
 __host__ __device__ LBM_FORCEINLINE int distribution_index(int q, int cell, int cell_count) {
-    return q * cell_count + cell;
+    return LBM_DISTRIBUTION_INDEX(q, cell, cell_count);
 }
 
 __host__ __device__ LBM_FORCEINLINE int physical_cell_index(
@@ -184,7 +196,7 @@ __host__ __device__ LBM_FORCEINLINE int physical_cell_index(
     const int px = shifted_index(x, sx[q], nx);
     const int py = shifted_index(y, sy[q], ny);
     const int pz = shifted_index(z, sz[q], nz);
-    return flatten_xyz(px, py, pz, nx, ny, nz);
+    return LBM_FLATTEN_XYZ(px, py, pz, nx, ny, nz);
 }
 
 __host__ __device__ LBM_FORCEINLINE int interior_area(const SimulationConfig& cfg) {

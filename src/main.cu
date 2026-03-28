@@ -483,7 +483,7 @@ void apply_user_node_type_primitives(std::vector<std::uint8_t>* node_type, const
     // lbm::fill_box(node_type, cfg, lbm::kWall, 8, 12, 6, 10, 6, 10);
     // lbm::fill_ball(node_type, cfg, lbm::kWall, 20.0, 12.0, 12.0, 4.0);
     // lbm::fill_plane(node_type, cfg, lbm::kInlet, lbm::PrimitiveAxis::X, 4, 0, 1, cfg.ny - 2, 1, cfg.nz - 2);
-    lbm::fill_cylinder(node_type, cfg, lbm::kWall, lbm::PrimitiveAxis::Z, 64.0, 32.0, 16.0, 0, 63);
+    // lbm::fill_cylinder(node_type, cfg, lbm::kWall, lbm::PrimitiveAxis::Z, 64.0, 32.0, 16.0, 0, 63);
     //
     // The node map is uploaded once after this hook and then used by both the
     // equilibrium initialization and all subsequent boundary kernels.
