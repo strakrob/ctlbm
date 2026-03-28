@@ -28,6 +28,7 @@ struct RuntimeOptions {
     std::string diagnostics_csv = "diagnostics.csv";
     bool write_cross_sections = false;
     bool do_not_write_full_volume = false;
+    bool write_node_map = false;
 };
 
 struct Diagnostics {
@@ -110,6 +111,7 @@ std::string format_bytes(std::size_t bytes) {
         << "  --inlet-velocity VALUE --inlet-profile uniform|parabolic\n"
         << "  --outlet extrapolation|zero-gauge-pressure\n"
         << "  --write-cross-sections\n"
+        << "  --write-node-map\n"
         << "  --do-not-write-full-volume\n"
         << "  --series-terms N --output-dir PATH\n";
     std::exit(0);
@@ -168,6 +170,8 @@ void parse_arguments(int argc, char** argv, SimulationConfig* cfg, RuntimeOption
             runtime->output_dir = require_value("--output-dir");
         } else if (arg == "--write-cross-sections") {
             runtime->write_cross_sections = true;
+        } else if (arg == "--write-node-map") {
+            runtime->write_node_map = true;
         } else if (arg == "--do-not-write-full-volume") {
             runtime->do_not_write_full_volume = true;
         } else if (arg == "--mode") {
@@ -479,7 +483,7 @@ void apply_user_node_type_primitives(std::vector<std::uint8_t>* node_type, const
     // lbm::fill_box(node_type, cfg, lbm::kWall, 8, 12, 6, 10, 6, 10);
     // lbm::fill_ball(node_type, cfg, lbm::kWall, 20.0, 12.0, 12.0, 4.0);
     // lbm::fill_plane(node_type, cfg, lbm::kInlet, lbm::PrimitiveAxis::X, 4, 0, 1, cfg.ny - 2, 1, cfg.nz - 2);
-    // lbm::fill_cylinder(node_type, cfg, lbm::kWall, lbm::PrimitiveAxis::X, 12.0, 12.0, 3.0, 10, 30);
+    lbm::fill_cylinder(node_type, cfg, lbm::kWall, lbm::PrimitiveAxis::Z, 64.0, 32.0, 16.0, 0, 63);
     //
     // The node map is uploaded once after this hook and then used by both the
     // equilibrium initialization and all subsequent boundary kernels.
@@ -543,6 +547,9 @@ int main(int argc, char** argv) {
             "copy node type field");
         lbm::launch_initialize_equilibrium(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
         lbm::cuda_check(cudaDeviceSynchronize(), "initialize solver state");
+        if (runtime.write_node_map) {
+            lbm::write_node_map_vti(runtime.output_dir + "/map.vti", cfg, host_node_type);
+        }
 
         std::ofstream diagnostics_csv(runtime.diagnostics_csv);
         if (!diagnostics_csv) {
@@ -590,6 +597,7 @@ int main(int argc, char** argv) {
                   << " outlet=" << outlet_name(cfg.outlet_mode)
                   << " inlet-profile=" << profile_name(cfg.inlet_profile)
                   << " cross-sections=" << (runtime.write_cross_sections ? "on" : "off")
+                  << " node-map=" << (runtime.write_node_map ? "on" : "off")
                   << " do-not-write-full-volume=" << (runtime.do_not_write_full_volume ? "on" : "off")
                   << '\n';
         print_memory_report(memory_report);

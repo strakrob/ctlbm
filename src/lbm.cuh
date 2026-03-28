@@ -283,5 +283,9 @@ void write_vti_midplane_cross_sections(
     const std::vector<Real>& ux,
     const std::vector<Real>& uy,
     const std::vector<Real>& uz);
+void write_node_map_vti(
+    const std::string& filename,
+    const SimulationConfig& cfg,
+    const std::vector<std::uint8_t>& node_type);
 
 }  // namespace lbm

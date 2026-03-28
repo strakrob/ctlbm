@@ -145,6 +145,10 @@ Show options:
 Add `--write-cross-sections` to emit midpoint `xy`, `xz`, and `yz` slice files
 alongside the standard 3D snapshot.
 
+Add `--write-node-map` to emit `map.vti` once after initialization. This is a
+debug view of the uploaded node-type field, with `node_type` values
+`0=fluid`, `1=wall`, `2=inlet`, `3=outlet`.
+
 ### Mode A example
 
 ```bash
@@ -204,6 +208,10 @@ With `--write-cross-sections`, each snapshot also writes:
 - `duct_step_0001000_xy.vti` at `z = Nz / 2`,
 - `duct_step_0001000_xz.vti` at `y = Ny / 2`,
 - `duct_step_0001000_yz.vti` at `x = Nx / 2`.
+
+With `--write-node-map`, the output directory also gets:
+
+- `map.vti` containing the initialized node-type field as a `UInt8` scalar.
 
 The `.vti` files contain:
 

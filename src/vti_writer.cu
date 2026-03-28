@@ -168,4 +168,38 @@ void write_vti_midplane_cross_sections(
     write_vti_image(output_stem + "_yz.vti", 0, 0, 0, cfg.ny - 1, 0, cfg.nz - 1, mid_x, 0, 0, rho_yz, ux_yz, uy_yz, uz_yz);
 }
 
+void write_node_map_vti(
+    const std::string& filename,
+    const SimulationConfig& cfg,
+    const std::vector<std::uint8_t>& node_type) {
+    if (node_type.size() != static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz)) {
+        throw std::runtime_error("write_node_map_vti requires a node map sized to nx * ny * nz.");
+    }
+
+    std::ofstream out(filename);
+    if (!out) {
+        throw std::runtime_error("Unable to open VTI output file: " + filename);
+    }
+
+    out << "<?xml version=\"1.0\"?>\n";
+    out << "<VTKFile type=\"ImageData\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+    out << "  <ImageData WholeExtent=\"0 " << cfg.nx - 1 << " 0 " << cfg.ny - 1 << " 0 " << cfg.nz - 1
+        << "\" Origin=\"0 0 0\" Spacing=\"1 1 1\">\n";
+    out << "    <Piece Extent=\"0 " << cfg.nx - 1 << " 0 " << cfg.ny - 1 << " 0 " << cfg.nz - 1 << "\">\n";
+    out << "      <PointData Scalars=\"node_type\">\n";
+    out << "        <DataArray type=\"UInt8\" Name=\"node_type\" format=\"ascii\">\n          ";
+    for (std::size_t i = 0; i < node_type.size(); ++i) {
+        out << static_cast<unsigned int>(node_type[i]) << ' ';
+        if ((i + 1) % 16 == 0) {
+            out << "\n          ";
+        }
+    }
+    out << "\n        </DataArray>\n";
+    out << "      </PointData>\n";
+    out << "      <CellData/>\n";
+    out << "    </Piece>\n";
+    out << "  </ImageData>\n";
+    out << "</VTKFile>\n";
+}
+
 }  // namespace lbm
