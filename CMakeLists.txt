@@ -1,13 +1,31 @@
-cmake_minimum_required(VERSION 3.20)
-project(lbmd3q27_cuda LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.24)
+
+set(CMAKE_CUDA_ARCHITECTURES 75 CACHE STRING "CUDA architectures to build")
+
+project(periodic_shift_duct_lbm LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 75)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+option(LBM_USE_FLOAT "Build the solver in single precision instead of double precision." OFF)
 
-add_executable(lbmd3q27 src/main.cu)
-set_target_properties(lbmd3q27 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+add_executable(lbmd3q27
+  src/main.cu
+  src/lbm_kernels.cu
+  src/boundary_conditions.cu
+  src/vti_writer.cu
+)
 
-target_compile_options(lbmd3q27 PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+target_include_directories(lbmd3q27 PRIVATE src)
+
+target_compile_features(lbmd3q27 PRIVATE cxx_std_17 cuda_std_17)
+
+target_compile_definitions(lbmd3q27 PRIVATE
+  $<$<BOOL:${LBM_USE_FLOAT}>:LBM_USE_FLOAT=1>
+)
+
+set_target_properties(lbmd3q27 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )

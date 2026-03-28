@@ -1,392 +1,472 @@
-#include <cuda_runtime.h>
+#include "lbm.cuh"
 
-#include <array>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
-#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
 
-constexpr int Q = 27;
-constexpr int BLOCK_SIZE = 128;
+using lbm::InletProfile;
+using lbm::NodeType;
+using lbm::OutletMode;
+using lbm::Real;
+using lbm::SimulationConfig;
+using lbm::StreamwiseMode;
 
-__constant__ int CX[Q];
-__constant__ int CY[Q];
-__constant__ int CZ[Q];
-__constant__ int OPP[Q];
-__constant__ double W[Q];
-
-inline void cuda_check(cudaError_t err, const char* msg) {
-    if (err != cudaSuccess) {
-        std::ostringstream os;
-        os << msg << ": " << cudaGetErrorString(err);
-        throw std::runtime_error(os.str());
-    }
-}
-
-struct SimulationParams {
-    int nx = 96;
-    int ny = 40;
-    int nz = 32;
-    int nsteps = 10000;
-    int output_every = 1000;
-    double tau = 0.8;
-    double u_max = 0.06;
+struct RuntimeOptions {
+    std::string output_dir = ".";
+    std::string diagnostics_csv = "diagnostics.csv";
 };
 
-__host__ __device__ inline int wrap(int v, int n) {
-    v %= n;
-    if (v < 0) {
-        v += n;
-    }
-    return v;
+struct Diagnostics {
+    int step = 0;
+    Real total_mass = Real(0.0);
+    Real mean_density = Real(0.0);
+    Real bulk_velocity = Real(0.0);
+    Real flow_rate = Real(0.0);
+    Real max_streamwise_velocity = Real(0.0);
+    Real residual = Real(0.0);
+    Real l2_error = Real(0.0);
+    Real balance_metric = Real(0.0);
+};
+
+std::string to_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
 }
 
-__host__ __device__ inline int index3d(int x, int y, int z, int nx, int ny, int nz) {
-    return (z * ny + y) * nx + x;
+std::string mode_name(StreamwiseMode mode) {
+    switch (mode) {
+        case StreamwiseMode::PeriodicBodyForce:
+            return "A";
+        case StreamwiseMode::Pressure:
+            return "B";
+        case StreamwiseMode::Velocity:
+            return "C";
+    }
+    return "?";
 }
 
-__global__ void initialize_kernel(double* f, std::uint8_t* solid, int nx, int ny, int nz) {
-    const int n = nx * ny * nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) {
-        return;
-    }
-
-    const int x = tid % nx;
-    const int yz = tid / nx;
-    const int y = yz % ny;
-    const int z = yz / ny;
-
-    const bool is_wall = (y == 0 || y == ny - 1 || z == 0 || z == nz - 1);
-    solid[tid] = is_wall ? 1 : 0;
-
-    for (int q = 0; q < Q; ++q) {
-        f[q * n + tid] = W[q];
-    }
-
-    (void)x;
+std::string outlet_name(OutletMode outlet_mode) {
+    return outlet_mode == OutletMode::Extrapolation ? "extrapolation" : "zero-gauge-pressure";
 }
 
-__device__ inline int shifted_linear_index(
-    int q,
-    int x,
-    int y,
-    int z,
-    int nx,
-    int ny,
-    int nz,
-    const int* sx,
-    const int* sy,
-    const int* sz) {
-    const int xx = wrap(x - sx[q], nx);
-    const int yy = wrap(y - sy[q], ny);
-    const int zz = wrap(z - sz[q], nz);
-    return index3d(xx, yy, zz, nx, ny, nz);
+std::string profile_name(InletProfile profile) {
+    return profile == InletProfile::Uniform ? "uniform" : "parabolic";
 }
 
-__global__ void collide_kernel(
-    double* f,
-    const std::uint8_t* solid,
-    int nx,
-    int ny,
-    int nz,
-    const int* sx,
-    const int* sy,
-    const int* sz,
-    double tau,
-    double force_x) {
-    const int n = nx * ny * nz;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) {
-        return;
-    }
-
-    const int x = tid % nx;
-    const int yz = tid / nx;
-    const int y = yz % ny;
-    const int z = yz / ny;
-
-    if (solid[tid]) {
-        for (int q = 0; q < Q; ++q) {
-            const int dst = shifted_linear_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-            const int src = shifted_linear_index(OPP[q], x, y, z, nx, ny, nz, sx, sy, sz);
-            const double reflected = f[OPP[q] * n + src];
-            f[q * n + dst] = reflected;
-        }
-        return;
-    }
-
-    double fi[Q];
-    double rho = 0.0;
-    double ux = 0.0;
-    double uy = 0.0;
-    double uz = 0.0;
-
-    for (int q = 0; q < Q; ++q) {
-        const int idx = shifted_linear_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-        const double val = f[q * n + idx];
-        fi[q] = val;
-        rho += val;
-        ux += val * static_cast<double>(CX[q]);
-        uy += val * static_cast<double>(CY[q]);
-        uz += val * static_cast<double>(CZ[q]);
-    }
-
-    ux = (ux + 0.5 * force_x) / rho;
-    uy /= rho;
-    uz /= rho;
-
-    const double uu = ux * ux + uy * uy + uz * uz;
-    const double omega = 1.0 / tau;
-
-    for (int q = 0; q < Q; ++q) {
-        const double cu = 3.0 * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
-        const double feq = W[q] * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * uu);
-        const double force_term = W[q] * (1.0 - 0.5 * omega) * 3.0 * CX[q] * force_x;
-        const double post = fi[q] - omega * (fi[q] - feq) + force_term;
-        const int idx = shifted_linear_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-        f[q * n + idx] = post;
-    }
+[[noreturn]] void usage_and_exit(const char* program) {
+    std::cout
+        << "Usage: " << program << " [options]\n"
+        << "  --nx N --ny N --nz N\n"
+        << "  --steps N --output-every N --diag-every N\n"
+        << "  --tau VALUE --mode A|B|C\n"
+        << "  --force-x VALUE\n"
+        << "  --rho0 VALUE --rho-inlet VALUE --rho-outlet VALUE\n"
+        << "  --inlet-velocity VALUE --inlet-profile uniform|parabolic\n"
+        << "  --outlet extrapolation|zero-gauge-pressure\n"
+        << "  --series-terms N --output-dir PATH\n";
+    std::exit(0);
 }
 
-void write_vti(
-    const std::string& file_name,
-    int nx,
-    int ny,
-    int nz,
-    const std::vector<double>& rho,
-    const std::vector<double>& ux,
-    const std::vector<double>& uy,
-    const std::vector<double>& uz) {
-    std::ofstream out(file_name);
-    if (!out) {
-        throw std::runtime_error("Unable to open output file: " + file_name);
+template <typename T>
+T parse_number(const std::string& text, const char* what) {
+    std::istringstream is(text);
+    T value{};
+    is >> value;
+    if (!is || !is.eof()) {
+        throw std::runtime_error(std::string("Unable to parse ") + what + " from '" + text + "'");
     }
+    return value;
+}
 
-    out << "<?xml version=\"1.0\"?>\n";
-    out << "<VTKFile type=\"ImageData\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
-    out << "  <ImageData WholeExtent=\"0 " << (nx - 1) << " 0 " << (ny - 1) << " 0 " << (nz - 1)
-        << "\" Origin=\"0 0 0\" Spacing=\"1 1 1\">\n";
-    out << "    <Piece Extent=\"0 " << (nx - 1) << " 0 " << (ny - 1) << " 0 " << (nz - 1) << "\">\n";
-    out << "      <PointData Scalars=\"rho\" Vectors=\"velocity\">\n";
+void parse_arguments(int argc, char** argv, SimulationConfig* cfg, RuntimeOptions* runtime) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        const auto require_value = [&](const char* option_name) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(std::string("Missing value for ") + option_name);
+            }
+            return argv[++i];
+        };
 
-    out << "        <DataArray type=\"Float64\" Name=\"rho\" format=\"ascii\">\n          ";
-    for (std::size_t i = 0; i < rho.size(); ++i) {
-        out << std::setprecision(14) << rho[i] << ' ';
-        if ((i + 1) % 6 == 0) {
-            out << "\n          ";
+        if (arg == "--help" || arg == "-h") {
+            usage_and_exit(argv[0]);
+        } else if (arg == "--nx") {
+            cfg->nx = parse_number<int>(require_value("--nx"), "nx");
+        } else if (arg == "--ny") {
+            cfg->ny = parse_number<int>(require_value("--ny"), "ny");
+        } else if (arg == "--nz") {
+            cfg->nz = parse_number<int>(require_value("--nz"), "nz");
+        } else if (arg == "--steps") {
+            cfg->nsteps = parse_number<int>(require_value("--steps"), "step count");
+        } else if (arg == "--output-every") {
+            cfg->output_every = parse_number<int>(require_value("--output-every"), "output interval");
+        } else if (arg == "--diag-every") {
+            cfg->diagnostic_every = parse_number<int>(require_value("--diag-every"), "diagnostic interval");
+        } else if (arg == "--tau") {
+            cfg->tau = parse_number<Real>(require_value("--tau"), "tau");
+        } else if (arg == "--force-x") {
+            cfg->body_force_x = parse_number<Real>(require_value("--force-x"), "body force");
+        } else if (arg == "--rho0") {
+            cfg->rho0 = parse_number<Real>(require_value("--rho0"), "reference density");
+        } else if (arg == "--rho-inlet") {
+            cfg->rho_inlet = parse_number<Real>(require_value("--rho-inlet"), "inlet density");
+        } else if (arg == "--rho-outlet") {
+            cfg->rho_outlet = parse_number<Real>(require_value("--rho-outlet"), "outlet density");
+        } else if (arg == "--inlet-velocity") {
+            cfg->inlet_velocity = parse_number<Real>(require_value("--inlet-velocity"), "inlet velocity");
+        } else if (arg == "--series-terms") {
+            cfg->analytical_terms = parse_number<int>(require_value("--series-terms"), "series term count");
+        } else if (arg == "--output-dir") {
+            runtime->output_dir = require_value("--output-dir");
+        } else if (arg == "--mode") {
+            const std::string mode = to_lower(require_value("--mode"));
+            if (mode == "a" || mode == "periodic" || mode == "body-force") {
+                cfg->mode = StreamwiseMode::PeriodicBodyForce;
+            } else if (mode == "b" || mode == "pressure") {
+                cfg->mode = StreamwiseMode::Pressure;
+            } else if (mode == "c" || mode == "velocity") {
+                cfg->mode = StreamwiseMode::Velocity;
+            } else {
+                throw std::runtime_error("Unsupported mode '" + mode + "'");
+            }
+        } else if (arg == "--outlet") {
+            const std::string outlet = to_lower(require_value("--outlet"));
+            if (outlet == "extrapolation" || outlet == "copy") {
+                cfg->outlet_mode = OutletMode::Extrapolation;
+            } else if (outlet == "zero-gauge-pressure" || outlet == "pressure") {
+                cfg->outlet_mode = OutletMode::ZeroGaugePressure;
+            } else {
+                throw std::runtime_error("Unsupported outlet mode '" + outlet + "'");
+            }
+        } else if (arg == "--inlet-profile") {
+            const std::string profile = to_lower(require_value("--inlet-profile"));
+            if (profile == "uniform") {
+                cfg->inlet_profile = InletProfile::Uniform;
+            } else if (profile == "parabolic") {
+                cfg->inlet_profile = InletProfile::Parabolic;
+            } else {
+                throw std::runtime_error("Unsupported inlet profile '" + profile + "'");
+            }
+        } else {
+            throw std::runtime_error("Unknown argument '" + arg + "'");
         }
     }
-    out << "\n        </DataArray>\n";
 
-    out << "        <DataArray type=\"Float64\" Name=\"velocity\" NumberOfComponents=\"3\" format=\"ascii\">\n          ";
-    for (std::size_t i = 0; i < ux.size(); ++i) {
-        out << std::setprecision(14) << ux[i] << ' ' << uy[i] << ' ' << uz[i] << ' ';
-        if ((i + 1) % 2 == 0) {
-            out << "\n          ";
-        }
-    }
-    out << "\n        </DataArray>\n";
-
-    out << "      </PointData>\n";
-    out << "      <CellData/>\n";
-    out << "    </Piece>\n";
-    out << "  </ImageData>\n";
-    out << "</VTKFile>\n";
+    runtime->diagnostics_csv = runtime->output_dir + "/diagnostics.csv";
 }
 
-void compute_macros_and_output(
-    const std::string& path,
+void validate_config(SimulationConfig* cfg) {
+    if (cfg->nx < 4 || cfg->ny < 4 || cfg->nz < 4) {
+        throw std::runtime_error("The duct needs at least 4 nodes in every direction.");
+    }
+    if (cfg->tau <= Real(0.5)) {
+        throw std::runtime_error("tau must be greater than 0.5 for positive viscosity.");
+    }
+    if (cfg->analytical_terms < 1) {
+        throw std::runtime_error("series-terms must be positive.");
+    }
+    cfg->omega = Real(1.0) / cfg->tau;
+}
+
+Real plane_flow_rate(const SimulationConfig& cfg, const std::vector<std::uint8_t>& node_type, const std::vector<Real>& ux, int x_plane) {
+    Real sum = Real(0.0);
+    for (int z = 0; z < cfg.nz; ++z) {
+        for (int y = 0; y < cfg.ny; ++y) {
+            const int cell = lbm::flatten_xyz(x_plane, y, z, cfg.nx, cfg.ny, cfg.nz);
+            if (node_type[cell] != lbm::kWall) {
+                sum += ux[cell];
+            }
+        }
+    }
+    return sum;
+}
+
+Real rectangular_duct_velocity(Real forcing, Real viscosity, int y, int z, const SimulationConfig& cfg) {
+    if (forcing == Real(0.0)) {
+        return Real(0.0);
+    }
+
+    const Real pi = Real(3.1415926535897932384626433832795);
+    const Real h = Real(cfg.ny - 1);
+    const Real w = Real(cfg.nz - 1);
+    const Real yy = Real(y);
+    const Real zz = Real(z);
+
+    Real sum = Real(0.0);
+    for (int n = 1, used = 0; used < cfg.analytical_terms; n += 2, ++used) {
+        const Real nn = Real(n);
+        const Real alpha = nn * pi / h;
+        const Real cosine_ratio = std::cosh(alpha * (zz - Real(0.5) * w)) / std::cosh(alpha * Real(0.5) * w);
+        sum += (Real(1.0) / (nn * nn * nn)) * (Real(1.0) - cosine_ratio) * std::sin(alpha * yy);
+    }
+
+    return Real(4.0) * forcing * h * h * sum / (viscosity * pi * pi * pi);
+}
+
+Diagnostics compute_diagnostics(
+    const SimulationConfig& cfg,
     int step,
-    int nx,
-    int ny,
-    int nz,
-    const std::vector<double>& host_f,
-    const std::vector<int>& sx,
-    const std::vector<int>& sy,
-    const std::vector<int>& sz,
-    const std::vector<std::uint8_t>& solid,
-    double force_x) {
-    const int n = nx * ny * nz;
-    std::vector<double> rho(n, 0.0), ux(n, 0.0), uy(n, 0.0), uz(n, 0.0);
+    const std::vector<std::uint8_t>& node_type,
+    const std::vector<Real>& rho,
+    const std::vector<Real>& ux,
+    Real initial_mass,
+    Real previous_bulk_velocity) {
+    Diagnostics diagnostics;
+    diagnostics.step = step;
 
-    static constexpr int cx_host[Q] = {
-        0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 1, -1};
-    static constexpr int cy_host[Q] = {
-        0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, 0, 0};
-    static constexpr int cz_host[Q] = {
-        0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1};
+    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    int fluid_nodes = 0;
+    Real total_mass = Real(0.0);
+    Real max_ux = -std::numeric_limits<Real>::max();
 
-    for (int z = 0; z < nz; ++z) {
-        for (int y = 0; y < ny; ++y) {
-            for (int x = 0; x < nx; ++x) {
-                const int id = index3d(x, y, z, nx, ny, nz);
-                if (solid[id]) {
-                    continue;
-                }
+    for (int cell = 0; cell < cell_count; ++cell) {
+        total_mass += rho[cell];
+        if (node_type[cell] != lbm::kWall) {
+            max_ux = std::max(max_ux, ux[cell]);
+            ++fluid_nodes;
+        }
+    }
 
-                double r = 0.0;
-                double vx = 0.0;
-                double vy = 0.0;
-                double vz = 0.0;
+    const int interior_x = std::min(std::max(1, cfg.nx / 2), cfg.nx - 2);
+    const Real flow_rate = plane_flow_rate(cfg, node_type, ux, interior_x);
+    const Real bulk_velocity = flow_rate / Real(lbm::interior_area(cfg));
 
-                for (int q = 0; q < Q; ++q) {
-                    const int xx = wrap(x - sx[q], nx);
-                    const int yy = wrap(y - sy[q], ny);
-                    const int zz = wrap(z - sz[q], nz);
-                    const int src = index3d(xx, yy, zz, nx, ny, nz);
-                    const double fq = host_f[q * n + src];
-                    r += fq;
-                    vx += fq * cx_host[q];
-                    vy += fq * cy_host[q];
-                    vz += fq * cz_host[q];
-                }
+    diagnostics.total_mass = total_mass;
+    diagnostics.mean_density = total_mass / Real(cell_count);
+    diagnostics.flow_rate = flow_rate;
+    diagnostics.bulk_velocity = bulk_velocity;
+    diagnostics.max_streamwise_velocity = (fluid_nodes > 0) ? max_ux : Real(0.0);
+    diagnostics.residual = (step == 0) ? Real(0.0) : std::abs(bulk_velocity - previous_bulk_velocity);
 
-                vx = (vx + 0.5 * force_x) / r;
-                vy /= r;
-                vz /= r;
+    if (step == 0) {
+        diagnostics.balance_metric = Real(0.0);
+    } else if (cfg.mode == StreamwiseMode::PeriodicBodyForce) {
+        diagnostics.balance_metric = std::abs(total_mass - initial_mass) / std::max(std::abs(initial_mass), Real(1.0e-20));
+    } else {
+        const Real q_in = plane_flow_rate(cfg, node_type, ux, 0);
+        const Real q_out = plane_flow_rate(cfg, node_type, ux, cfg.nx - 1);
+        diagnostics.balance_metric = std::abs(q_in - q_out) / std::max(std::abs(q_in), Real(1.0e-20));
+    }
 
-                rho[id] = r;
-                ux[id] = vx;
-                uy[id] = vy;
-                uz[id] = vz;
+    Real l2_num = Real(0.0);
+    Real l2_den = Real(0.0);
+
+    if (cfg.mode == StreamwiseMode::Velocity) {
+        for (int z = 1; z < cfg.nz - 1; ++z) {
+            for (int y = 1; y < cfg.ny - 1; ++y) {
+                const int cell = lbm::flatten_xyz(0, y, z, cfg.nx, cfg.ny, cfg.nz);
+                const Real target = lbm::prescribed_inlet_velocity_x(y, z, cfg);
+                const Real diff = ux[cell] - target;
+                l2_num += diff * diff;
+                l2_den += target * target;
+            }
+        }
+    } else {
+        const Real viscosity = (cfg.tau - Real(0.5)) / Real(3.0);
+        const Real forcing = (cfg.mode == StreamwiseMode::PeriodicBodyForce)
+            ? cfg.body_force_x
+            : lbm::kCs2 * (cfg.rho_inlet - cfg.rho_outlet) / (cfg.rho0 * Real(cfg.nx - 1));
+
+        for (int z = 1; z < cfg.nz - 1; ++z) {
+            for (int y = 1; y < cfg.ny - 1; ++y) {
+                const int cell = lbm::flatten_xyz(interior_x, y, z, cfg.nx, cfg.ny, cfg.nz);
+                const Real exact = rectangular_duct_velocity(forcing, viscosity, y, z, cfg);
+                const Real diff = ux[cell] - exact;
+                l2_num += diff * diff;
+                l2_den += exact * exact;
             }
         }
     }
 
-    std::ostringstream filename;
-    filename << path << "/duct_step_" << std::setw(7) << std::setfill('0') << step << ".vti";
-    write_vti(filename.str(), nx, ny, nz, rho, ux, uy, uz);
+    diagnostics.l2_error = std::sqrt(l2_num / std::max(l2_den, Real(1.0e-20)));
+    return diagnostics;
+}
+
+void print_diagnostics(const Diagnostics& diagnostics, StreamwiseMode mode) {
+    std::cout << "step=" << diagnostics.step
+              << " mode=" << mode_name(mode)
+              << " mass=" << std::setprecision(10) << diagnostics.total_mass
+              << " mean_rho=" << diagnostics.mean_density
+              << " bulk_u=" << diagnostics.bulk_velocity
+              << " flow_rate=" << diagnostics.flow_rate
+              << " max_ux=" << diagnostics.max_streamwise_velocity
+              << " residual=" << diagnostics.residual
+              << " l2=" << diagnostics.l2_error
+              << " balance=" << diagnostics.balance_metric << '\n';
+}
+
+void append_diagnostics_csv(std::ofstream& csv, const Diagnostics& diagnostics) {
+    csv << diagnostics.step << ','
+        << std::setprecision(16) << diagnostics.total_mass << ','
+        << diagnostics.mean_density << ','
+        << diagnostics.bulk_velocity << ','
+        << diagnostics.flow_rate << ','
+        << diagnostics.max_streamwise_velocity << ','
+        << diagnostics.residual << ','
+        << diagnostics.l2_error << ','
+        << diagnostics.balance_metric << '\n';
+}
+
+void update_shift_vectors(
+    const SimulationConfig& cfg,
+    std::array<int, lbm::kQ>* sx,
+    std::array<int, lbm::kQ>* sy,
+    std::array<int, lbm::kQ>* sz) {
+    // One timestep of streaming is represented only by incrementing the logical
+    // offset of each population by its discrete velocity component.
+    for (int q = 0; q < lbm::kQ; ++q) {
+        (*sx)[q] = lbm::wrap_index((*sx)[q] + lbm::kCx[q], cfg.nx);
+        (*sy)[q] = lbm::wrap_index((*sy)[q] + lbm::kCy[q], cfg.ny);
+        (*sz)[q] = lbm::wrap_index((*sz)[q] + lbm::kCz[q], cfg.nz);
+    }
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
-        SimulationParams p;
-        if (argc > 1) p.nx = std::stoi(argv[1]);
-        if (argc > 2) p.ny = std::stoi(argv[2]);
-        if (argc > 3) p.nz = std::stoi(argv[3]);
-        if (argc > 4) p.nsteps = std::stoi(argv[4]);
-        if (argc > 5) p.output_every = std::stoi(argv[5]);
+        SimulationConfig cfg;
+        RuntimeOptions runtime;
+        parse_arguments(argc, argv, &cfg, &runtime);
+        validate_config(&cfg);
 
-        const int n = p.nx * p.ny * p.nz;
-        const double nu = (p.tau - 0.5) / 3.0;
-        const double hy = static_cast<double>(p.ny - 2);
-        const double hz = static_cast<double>(p.nz - 2);
-        const double h_eff = 0.5 * (hy + hz);
-        const double force_x = 8.0 * nu * p.u_max / (h_eff * h_eff);
+        std::filesystem::create_directories(runtime.output_dir);
 
-        std::array<int, Q> cx = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 1, -1};
-        std::array<int, Q> cy = {0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, 0, 0};
-        std::array<int, Q> cz = {0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1};
-        std::array<double, Q> w = {
-            8.0 / 27.0,
-            2.0 / 27.0,
-            2.0 / 27.0,
-            2.0 / 27.0,
-            2.0 / 27.0,
-            2.0 / 27.0,
-            2.0 / 27.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 54.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0,
-            1.0 / 216.0};
+        lbm::copy_lattice_constants_to_device();
 
-        std::array<int, Q> opp{};
-        for (int i = 0; i < Q; ++i) {
-            for (int j = 0; j < Q; ++j) {
-                if (cx[i] == -cx[j] && cy[i] == -cy[j] && cz[i] == -cz[j]) {
-                    opp[i] = j;
-                    break;
-                }
-            }
-        }
+        const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+        const std::size_t field_bytes = sizeof(Real) * static_cast<std::size_t>(cell_count);
 
-        cuda_check(cudaMemcpyToSymbol(CX, cx.data(), sizeof(int) * Q), "copy CX");
-        cuda_check(cudaMemcpyToSymbol(CY, cy.data(), sizeof(int) * Q), "copy CY");
-        cuda_check(cudaMemcpyToSymbol(CZ, cz.data(), sizeof(int) * Q), "copy CZ");
-        cuda_check(cudaMemcpyToSymbol(W, w.data(), sizeof(double) * Q), "copy W");
-        cuda_check(cudaMemcpyToSymbol(OPP, opp.data(), sizeof(int) * Q), "copy OPP");
-
-        double* d_f = nullptr;
-        std::uint8_t* d_solid = nullptr;
+        Real* d_f = nullptr;
+        Real* d_rho = nullptr;
+        Real* d_ux = nullptr;
+        Real* d_uy = nullptr;
+        Real* d_uz = nullptr;
+        std::uint8_t* d_node_type = nullptr;
         int* d_sx = nullptr;
         int* d_sy = nullptr;
         int* d_sz = nullptr;
 
-        cuda_check(cudaMalloc(&d_f, sizeof(double) * Q * n), "malloc d_f");
-        cuda_check(cudaMalloc(&d_solid, sizeof(std::uint8_t) * n), "malloc d_solid");
-        cuda_check(cudaMalloc(&d_sx, sizeof(int) * Q), "malloc d_sx");
-        cuda_check(cudaMalloc(&d_sy, sizeof(int) * Q), "malloc d_sy");
-        cuda_check(cudaMalloc(&d_sz, sizeof(int) * Q), "malloc d_sz");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_f), sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * cell_count), "allocate DF field");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_rho), field_bytes), "allocate rho field");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ux), field_bytes), "allocate ux field");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_uy), field_bytes), "allocate uy field");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_uz), field_bytes), "allocate uz field");
+        lbm::cuda_check(
+            cudaMalloc(reinterpret_cast<void**>(&d_node_type), sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count)),
+            "allocate node type field");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sx), sizeof(int) * lbm::kQ), "allocate x shifts");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sy), sizeof(int) * lbm::kQ), "allocate y shifts");
+        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sz), sizeof(int) * lbm::kQ), "allocate z shifts");
 
-        const int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        initialize_kernel<<<blocks, BLOCK_SIZE>>>(d_f, d_solid, p.nx, p.ny, p.nz);
-        cuda_check(cudaGetLastError(), "launch initialize_kernel");
-        cuda_check(cudaDeviceSynchronize(), "sync after init");
+        std::array<int, lbm::kQ> shift_x{};
+        std::array<int, lbm::kQ> shift_y{};
+        std::array<int, lbm::kQ> shift_z{};
+        lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial x shifts");
+        lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial y shifts");
+        lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial z shifts");
 
-        std::vector<int> sx(Q, 0), sy(Q, 0), sz(Q, 0);
-        std::vector<double> host_f(Q * n, 0.0);
-        std::vector<std::uint8_t> host_solid(n, 0);
-        cuda_check(cudaMemcpy(host_solid.data(), d_solid, sizeof(std::uint8_t) * n, cudaMemcpyDeviceToHost), "copy solid");
+        lbm::launch_classify_nodes(d_node_type, cfg);
+        lbm::launch_initialize_equilibrium(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+        lbm::cuda_check(cudaDeviceSynchronize(), "initialize solver state");
 
-        std::cout << "Running D3Q27 SRT duct flow (" << p.nx << " x " << p.ny << " x " << p.nz << ") for "
-                  << p.nsteps << " steps\n";
+        std::vector<std::uint8_t> host_node_type(cell_count, 0);
+        std::vector<Real> host_rho(cell_count, Real(0.0));
+        std::vector<Real> host_ux(cell_count, Real(0.0));
+        std::vector<Real> host_uy(cell_count, Real(0.0));
+        std::vector<Real> host_uz(cell_count, Real(0.0));
 
-        for (int step = 1; step <= p.nsteps; ++step) {
-            for (int q = 0; q < Q; ++q) {
-                sx[q] = wrap(sx[q] + cx[q], p.nx);
-                sy[q] = wrap(sy[q] + cy[q], p.ny);
-                sz[q] = wrap(sz[q] + cz[q], p.nz);
+        lbm::cuda_check(
+            cudaMemcpy(host_node_type.data(), d_node_type, sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count), cudaMemcpyDeviceToHost),
+            "copy node type field");
+
+        std::ofstream diagnostics_csv(runtime.diagnostics_csv);
+        if (!diagnostics_csv) {
+            throw std::runtime_error("Unable to open diagnostics CSV: " + runtime.diagnostics_csv);
+        }
+        diagnostics_csv << "step,total_mass,mean_density,bulk_velocity,flow_rate,max_streamwise_velocity,residual,l2_error,balance_metric\n";
+
+        auto recover_to_host = [&](int step, bool write_output, Real initial_mass, Real* previous_bulk_velocity) {
+            lbm::launch_recover_macros(d_f, d_node_type, cfg, d_sx, d_sy, d_sz, d_rho, d_ux, d_uy, d_uz);
+            lbm::cuda_check(cudaDeviceSynchronize(), "recover macroscopic fields");
+            lbm::cuda_check(cudaMemcpy(host_rho.data(), d_rho, field_bytes, cudaMemcpyDeviceToHost), "copy rho to host");
+            lbm::cuda_check(cudaMemcpy(host_ux.data(), d_ux, field_bytes, cudaMemcpyDeviceToHost), "copy ux to host");
+            lbm::cuda_check(cudaMemcpy(host_uy.data(), d_uy, field_bytes, cudaMemcpyDeviceToHost), "copy uy to host");
+            lbm::cuda_check(cudaMemcpy(host_uz.data(), d_uz, field_bytes, cudaMemcpyDeviceToHost), "copy uz to host");
+
+            const Diagnostics diagnostics = compute_diagnostics(cfg, step, host_node_type, host_rho, host_ux, initial_mass, *previous_bulk_velocity);
+            print_diagnostics(diagnostics, cfg.mode);
+            append_diagnostics_csv(diagnostics_csv, diagnostics);
+            *previous_bulk_velocity = diagnostics.bulk_velocity;
+
+            if (write_output) {
+                std::ostringstream filename;
+                filename << runtime.output_dir << "/duct_step_" << std::setw(7) << std::setfill('0') << step << ".vti";
+                lbm::write_vti(filename.str(), cfg, host_rho, host_ux, host_uy, host_uz);
             }
 
-            cuda_check(cudaMemcpy(d_sx, sx.data(), sizeof(int) * Q, cudaMemcpyHostToDevice), "copy sx");
-            cuda_check(cudaMemcpy(d_sy, sy.data(), sizeof(int) * Q, cudaMemcpyHostToDevice), "copy sy");
-            cuda_check(cudaMemcpy(d_sz, sz.data(), sizeof(int) * Q, cudaMemcpyHostToDevice), "copy sz");
+            return diagnostics;
+        };
 
-            collide_kernel<<<blocks, BLOCK_SIZE>>>(d_f, d_solid, p.nx, p.ny, p.nz, d_sx, d_sy, d_sz, p.tau, force_x);
-            cuda_check(cudaGetLastError(), "launch collide_kernel");
+        std::cout << "Running D3Q27 single-grid periodic-shift solver"
+                  << " nx=" << cfg.nx
+                  << " ny=" << cfg.ny
+                  << " nz=" << cfg.nz
+                  << " steps=" << cfg.nsteps
+                  << " mode=" << mode_name(cfg.mode)
+                  << " outlet=" << outlet_name(cfg.outlet_mode)
+                  << " inlet-profile=" << profile_name(cfg.inlet_profile) << '\n';
 
-            if (step % p.output_every == 0 || step == p.nsteps) {
-                cuda_check(cudaDeviceSynchronize(), "sync before output");
-                cuda_check(cudaMemcpy(host_f.data(), d_f, sizeof(double) * Q * n, cudaMemcpyDeviceToHost), "copy f");
-                compute_macros_and_output(".", step, p.nx, p.ny, p.nz, host_f, sx, sy, sz, host_solid, force_x);
-                std::cout << "Wrote VTI at step " << step << '\n';
+        Real previous_bulk_velocity = Real(0.0);
+        const Diagnostics initial_diagnostics = recover_to_host(0, true, Real(0.0), &previous_bulk_velocity);
+        const Real initial_mass = initial_diagnostics.total_mass;
+
+        for (int step = 1; step <= cfg.nsteps; ++step) {
+            update_shift_vectors(cfg, &shift_x, &shift_y, &shift_z);
+            lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update x shifts");
+            lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update y shifts");
+            lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update z shifts");
+
+            lbm::launch_collide_and_stream(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+            // Boundary reconstruction always runs after the streamed field exists
+            // in logical form at the current shift state.
+            lbm::launch_apply_wall_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+            if (cfg.mode == StreamwiseMode::Pressure) {
+                lbm::launch_apply_pressure_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+            } else if (cfg.mode == StreamwiseMode::Velocity) {
+                lbm::launch_apply_velocity_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+            }
+
+            const bool write_output = (cfg.output_every > 0) && (step % cfg.output_every == 0 || step == cfg.nsteps);
+            const bool print_diagnostics = (cfg.diagnostic_every > 0) && (step % cfg.diagnostic_every == 0 || step == cfg.nsteps);
+            if (write_output || print_diagnostics) {
+                recover_to_host(step, write_output, initial_mass, &previous_bulk_velocity);
             }
         }
 
-        cudaFree(d_f);
-        cudaFree(d_solid);
-        cudaFree(d_sx);
-        cudaFree(d_sy);
-        cudaFree(d_sz);
+        lbm::cuda_check(cudaFree(d_f), "free DF field");
+        lbm::cuda_check(cudaFree(d_rho), "free rho field");
+        lbm::cuda_check(cudaFree(d_ux), "free ux field");
+        lbm::cuda_check(cudaFree(d_uy), "free uy field");
+        lbm::cuda_check(cudaFree(d_uz), "free uz field");
+        lbm::cuda_check(cudaFree(d_node_type), "free node type field");
+        lbm::cuda_check(cudaFree(d_sx), "free x shifts");
+        lbm::cuda_check(cudaFree(d_sy), "free y shifts");
+        lbm::cuda_check(cudaFree(d_sz), "free z shifts");
         return 0;
-    } catch (const std::exception& ex) {
-        std::cerr << "Error: " << ex.what() << '\n';
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
         return 1;
     }
 }

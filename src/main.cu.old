@@ -1,0 +1,392 @@
+#include <cuda_runtime.h>
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr int Q = 27;
+constexpr int BLOCK_SIZE = 128;
+
+__constant__ int CX[Q];
+__constant__ int CY[Q];
+__constant__ int CZ[Q];
+__constant__ int OPP[Q];
+__constant__ double W[Q];
+
+inline void cuda_check(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        std::ostringstream os;
+        os << msg << ": " << cudaGetErrorString(err);
+        throw std::runtime_error(os.str());
+    }
+}
+
+struct SimulationParams {
+    int nx = 96;
+    int ny = 40;
+    int nz = 32;
+    int nsteps = 10000;
+    int output_every = 1000;
+    double tau = 0.8;
+    double u_max = 0.06;
+};
+
+__host__ __device__ inline int wrap(int v, int n) {
+    v %= n;
+    if (v < 0) {
+        v += n;
+    }
+    return v;
+}
+
+__host__ __device__ inline int index3d(int x, int y, int z, int nx, int ny, int nz) {
+    return (z * ny + y) * nx + x;
+}
+
+__global__ void initialize_kernel(double* f, std::uint8_t* solid, int nx, int ny, int nz) {
+    const int n = nx * ny * nz;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+
+    const int x = tid % nx;
+    const int yz = tid / nx;
+    const int y = yz % ny;
+    const int z = yz / ny;
+
+    const bool is_wall = (y == 0 || y == ny - 1 || z == 0 || z == nz - 1);
+    solid[tid] = is_wall ? 1 : 0;
+
+    for (int q = 0; q < Q; ++q) {
+        f[q * n + tid] = W[q];
+    }
+
+    (void)x;
+}
+
+__device__ inline int shifted_linear_index(
+    int q,
+    int x,
+    int y,
+    int z,
+    int nx,
+    int ny,
+    int nz,
+    const int* sx,
+    const int* sy,
+    const int* sz) {
+    const int xx = wrap(x - sx[q], nx);
+    const int yy = wrap(y - sy[q], ny);
+    const int zz = wrap(z - sz[q], nz);
+    return index3d(xx, yy, zz, nx, ny, nz);
+}
+
+__global__ void collide_kernel(
+    double* f,
+    const std::uint8_t* solid,
+    int nx,
+    int ny,
+    int nz,
+    const int* sx,
+    const int* sy,
+    const int* sz,
+    double tau,
+    double force_x) {
+    const int n = nx * ny * nz;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+
+    const int x = tid % nx;
+    const int yz = tid / nx;
+    const int y = yz % ny;
+    const int z = yz / ny;
+
+    if (solid[tid]) {
+        for (int q = 0; q < Q; ++q) {
+            const int dst = shifted_linear_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
+            const int src = shifted_linear_index(OPP[q], x, y, z, nx, ny, nz, sx, sy, sz);
+            const double reflected = f[OPP[q] * n + src];
+            f[q * n + dst] = reflected;
+        }
+        return;
+    }
+
+    double fi[Q];
+    double rho = 0.0;
+    double ux = 0.0;
+    double uy = 0.0;
+    double uz = 0.0;
+
+    for (int q = 0; q < Q; ++q) {
+        const int idx = shifted_linear_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
+        const double val = f[q * n + idx];
+        fi[q] = val;
+        rho += val;
+        ux += val * static_cast<double>(CX[q]);
+        uy += val * static_cast<double>(CY[q]);
+        uz += val * static_cast<double>(CZ[q]);
+    }
+
+    ux = (ux + 0.5 * force_x) / rho;
+    uy /= rho;
+    uz /= rho;
+
+    const double uu = ux * ux + uy * uy + uz * uz;
+    const double omega = 1.0 / tau;
+
+    for (int q = 0; q < Q; ++q) {
+        const double cu = 3.0 * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
+        const double feq = W[q] * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * uu);
+        const double force_term = W[q] * (1.0 - 0.5 * omega) * 3.0 * CX[q] * force_x;
+        const double post = fi[q] - omega * (fi[q] - feq) + force_term;
+        const int idx = shifted_linear_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
+        f[q * n + idx] = post;
+    }
+}
+
+void write_vti(
+    const std::string& file_name,
+    int nx,
+    int ny,
+    int nz,
+    const std::vector<double>& rho,
+    const std::vector<double>& ux,
+    const std::vector<double>& uy,
+    const std::vector<double>& uz) {
+    std::ofstream out(file_name);
+    if (!out) {
+        throw std::runtime_error("Unable to open output file: " + file_name);
+    }
+
+    out << "<?xml version=\"1.0\"?>\n";
+    out << "<VTKFile type=\"ImageData\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+    out << "  <ImageData WholeExtent=\"0 " << (nx - 1) << " 0 " << (ny - 1) << " 0 " << (nz - 1)
+        << "\" Origin=\"0 0 0\" Spacing=\"1 1 1\">\n";
+    out << "    <Piece Extent=\"0 " << (nx - 1) << " 0 " << (ny - 1) << " 0 " << (nz - 1) << "\">\n";
+    out << "      <PointData Scalars=\"rho\" Vectors=\"velocity\">\n";
+
+    out << "        <DataArray type=\"Float64\" Name=\"rho\" format=\"ascii\">\n          ";
+    for (std::size_t i = 0; i < rho.size(); ++i) {
+        out << std::setprecision(14) << rho[i] << ' ';
+        if ((i + 1) % 6 == 0) {
+            out << "\n          ";
+        }
+    }
+    out << "\n        </DataArray>\n";
+
+    out << "        <DataArray type=\"Float64\" Name=\"velocity\" NumberOfComponents=\"3\" format=\"ascii\">\n          ";
+    for (std::size_t i = 0; i < ux.size(); ++i) {
+        out << std::setprecision(14) << ux[i] << ' ' << uy[i] << ' ' << uz[i] << ' ';
+        if ((i + 1) % 2 == 0) {
+            out << "\n          ";
+        }
+    }
+    out << "\n        </DataArray>\n";
+
+    out << "      </PointData>\n";
+    out << "      <CellData/>\n";
+    out << "    </Piece>\n";
+    out << "  </ImageData>\n";
+    out << "</VTKFile>\n";
+}
+
+void compute_macros_and_output(
+    const std::string& path,
+    int step,
+    int nx,
+    int ny,
+    int nz,
+    const std::vector<double>& host_f,
+    const std::vector<int>& sx,
+    const std::vector<int>& sy,
+    const std::vector<int>& sz,
+    const std::vector<std::uint8_t>& solid,
+    double force_x) {
+    const int n = nx * ny * nz;
+    std::vector<double> rho(n, 0.0), ux(n, 0.0), uy(n, 0.0), uz(n, 0.0);
+
+    static constexpr int cx_host[Q] = {
+        0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 1, -1};
+    static constexpr int cy_host[Q] = {
+        0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, 0, 0};
+    static constexpr int cz_host[Q] = {
+        0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1};
+
+    for (int z = 0; z < nz; ++z) {
+        for (int y = 0; y < ny; ++y) {
+            for (int x = 0; x < nx; ++x) {
+                const int id = index3d(x, y, z, nx, ny, nz);
+                if (solid[id]) {
+                    continue;
+                }
+
+                double r = 0.0;
+                double vx = 0.0;
+                double vy = 0.0;
+                double vz = 0.0;
+
+                for (int q = 0; q < Q; ++q) {
+                    const int xx = wrap(x - sx[q], nx);
+                    const int yy = wrap(y - sy[q], ny);
+                    const int zz = wrap(z - sz[q], nz);
+                    const int src = index3d(xx, yy, zz, nx, ny, nz);
+                    const double fq = host_f[q * n + src];
+                    r += fq;
+                    vx += fq * cx_host[q];
+                    vy += fq * cy_host[q];
+                    vz += fq * cz_host[q];
+                }
+
+                vx = (vx + 0.5 * force_x) / r;
+                vy /= r;
+                vz /= r;
+
+                rho[id] = r;
+                ux[id] = vx;
+                uy[id] = vy;
+                uz[id] = vz;
+            }
+        }
+    }
+
+    std::ostringstream filename;
+    filename << path << "/duct_step_" << std::setw(7) << std::setfill('0') << step << ".vti";
+    write_vti(filename.str(), nx, ny, nz, rho, ux, uy, uz);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        SimulationParams p;
+        if (argc > 1) p.nx = std::stoi(argv[1]);
+        if (argc > 2) p.ny = std::stoi(argv[2]);
+        if (argc > 3) p.nz = std::stoi(argv[3]);
+        if (argc > 4) p.nsteps = std::stoi(argv[4]);
+        if (argc > 5) p.output_every = std::stoi(argv[5]);
+
+        const int n = p.nx * p.ny * p.nz;
+        const double nu = (p.tau - 0.5) / 3.0;
+        const double hy = static_cast<double>(p.ny - 2);
+        const double hz = static_cast<double>(p.nz - 2);
+        const double h_eff = 0.5 * (hy + hz);
+        const double force_x = 8.0 * nu * p.u_max / (h_eff * h_eff);
+
+        std::array<int, Q> cx = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 0, 0, 1, -1, 1, -1, 1, -1};
+        std::array<int, Q> cy = {0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, 0, 0};
+        std::array<int, Q> cz = {0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1};
+        std::array<double, Q> w = {
+            8.0 / 27.0,
+            2.0 / 27.0,
+            2.0 / 27.0,
+            2.0 / 27.0,
+            2.0 / 27.0,
+            2.0 / 27.0,
+            2.0 / 27.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 54.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0,
+            1.0 / 216.0};
+
+        std::array<int, Q> opp{};
+        for (int i = 0; i < Q; ++i) {
+            for (int j = 0; j < Q; ++j) {
+                if (cx[i] == -cx[j] && cy[i] == -cy[j] && cz[i] == -cz[j]) {
+                    opp[i] = j;
+                    break;
+                }
+            }
+        }
+
+        cuda_check(cudaMemcpyToSymbol(CX, cx.data(), sizeof(int) * Q), "copy CX");
+        cuda_check(cudaMemcpyToSymbol(CY, cy.data(), sizeof(int) * Q), "copy CY");
+        cuda_check(cudaMemcpyToSymbol(CZ, cz.data(), sizeof(int) * Q), "copy CZ");
+        cuda_check(cudaMemcpyToSymbol(W, w.data(), sizeof(double) * Q), "copy W");
+        cuda_check(cudaMemcpyToSymbol(OPP, opp.data(), sizeof(int) * Q), "copy OPP");
+
+        double* d_f = nullptr;
+        std::uint8_t* d_solid = nullptr;
+        int* d_sx = nullptr;
+        int* d_sy = nullptr;
+        int* d_sz = nullptr;
+
+        cuda_check(cudaMalloc(&d_f, sizeof(double) * Q * n), "malloc d_f");
+        cuda_check(cudaMalloc(&d_solid, sizeof(std::uint8_t) * n), "malloc d_solid");
+        cuda_check(cudaMalloc(&d_sx, sizeof(int) * Q), "malloc d_sx");
+        cuda_check(cudaMalloc(&d_sy, sizeof(int) * Q), "malloc d_sy");
+        cuda_check(cudaMalloc(&d_sz, sizeof(int) * Q), "malloc d_sz");
+
+        const int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        initialize_kernel<<<blocks, BLOCK_SIZE>>>(d_f, d_solid, p.nx, p.ny, p.nz);
+        cuda_check(cudaGetLastError(), "launch initialize_kernel");
+        cuda_check(cudaDeviceSynchronize(), "sync after init");
+
+        std::vector<int> sx(Q, 0), sy(Q, 0), sz(Q, 0);
+        std::vector<double> host_f(Q * n, 0.0);
+        std::vector<std::uint8_t> host_solid(n, 0);
+        cuda_check(cudaMemcpy(host_solid.data(), d_solid, sizeof(std::uint8_t) * n, cudaMemcpyDeviceToHost), "copy solid");
+
+        std::cout << "Running D3Q27 SRT duct flow (" << p.nx << " x " << p.ny << " x " << p.nz << ") for "
+                  << p.nsteps << " steps\n";
+
+        for (int step = 1; step <= p.nsteps; ++step) {
+            for (int q = 0; q < Q; ++q) {
+                sx[q] = wrap(sx[q] + cx[q], p.nx);
+                sy[q] = wrap(sy[q] + cy[q], p.ny);
+                sz[q] = wrap(sz[q] + cz[q], p.nz);
+            }
+
+            cuda_check(cudaMemcpy(d_sx, sx.data(), sizeof(int) * Q, cudaMemcpyHostToDevice), "copy sx");
+            cuda_check(cudaMemcpy(d_sy, sy.data(), sizeof(int) * Q, cudaMemcpyHostToDevice), "copy sy");
+            cuda_check(cudaMemcpy(d_sz, sz.data(), sizeof(int) * Q, cudaMemcpyHostToDevice), "copy sz");
+
+            collide_kernel<<<blocks, BLOCK_SIZE>>>(d_f, d_solid, p.nx, p.ny, p.nz, d_sx, d_sy, d_sz, p.tau, force_x);
+            cuda_check(cudaGetLastError(), "launch collide_kernel");
+
+            if (step % p.output_every == 0 || step == p.nsteps || step == 2) {
+                cuda_check(cudaDeviceSynchronize(), "sync before output");
+                cuda_check(cudaMemcpy(host_f.data(), d_f, sizeof(double) * Q * n, cudaMemcpyDeviceToHost), "copy f");
+                compute_macros_and_output(".", step, p.nx, p.ny, p.nz, host_f, sx, sy, sz, host_solid, force_x);
+                std::cout << "Wrote VTI at step " << step << '\n';
+            }
+        }
+
+        cudaFree(d_f);
+        cudaFree(d_solid);
+        cudaFree(d_sx);
+        cudaFree(d_sy);
+        cudaFree(d_sz);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
+    }
+}

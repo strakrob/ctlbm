@@ -1,2 +1,6 @@
 build/
 *.vti
+.git/
+.vscode/
+*.md
+.old\

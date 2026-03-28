@@ -1,40 +1,230 @@
-# CUDA D3Q27 LBM (SRT) with periodic-shift streaming
+# Periodic-Shift D3Q27 Duct Solver
 
-This repository contains a CUDA C implementation of a **D3Q27** lattice Boltzmann solver using a **single-relaxation-time (SRT/BGK)** collision model.
+This repository implements a CUDA C/C++ lattice Boltzmann solver for 3D incompressible rectangular-duct flow with:
 
-## Implemented requirements
+- D3Q27 lattice.
+- SRT / BGK collision.
+- double precision by default, optional single precision via `-DLBM_USE_FLOAT=ON`.
+- one distribution-function storage set only.
+- periodic-shift streaming with per-population logical offsets.
+- `.vti` output for ParaView.
+- three selectable streamwise boundary-condition modes.
 
-- D3Q27 stencil.
-- SRT collision operator.
-- Poiseuille-type flow in a rectangular duct (periodic in streamwise `x`, no-slip walls at `y/z` boundaries).
-- Streaming is implemented with a **periodic shift map** (`sx, sy, sz`) over one distribution array (no ping-pong swap).
-- Output snapshots are written in VTK XML ImageData (`.vti`) format.
+## What “single-grid periodic-shift” means here
+
+The solver keeps exactly one physical DF array of size `Q * Nx * Ny * Nz`.
+
+It does **not** use:
+
+- ping-pong fields,
+- source/destination swaps,
+- pull/push double buffering.
+
+Instead, each population `q` carries cumulative logical shifts `sx[q]`, `sy[q]`, `sz[q]`. A logical access to `(q, x, y, z)` is mapped to physical storage by:
+
+```text
+physical_x = wrap(x - sx[q], Nx)
+physical_y = wrap(y - sy[q], Ny)
+physical_z = wrap(z - sz[q], Nz)
+```
+
+At every timestep the host updates the shift vectors by the discrete velocity:
+
+```text
+sx[q] <- wrap(sx[q] + cx[q], Nx)
+sy[q] <- wrap(sy[q] + cy[q], Ny)
+sz[q] <- wrap(sz[q] + cz[q], Nz)
+```
+
+The collision kernel then:
+
+1. reads the logical field at time `t` via the previous shifts,
+2. computes macroscopic fields, equilibrium, BGK collision, and Guo forcing if enabled,
+3. writes the post-collision state back through the new shifts.
+
+That write is the streamed state at `t + 1`, still inside the same DF array.
+
+## Source layout
+
+- `src/lbm.cuh`: shared types, D3Q27 constants, indexing helpers, shift-address mapping.
+- `src/lbm_kernels.cu`: initialization, macroscopic recovery, BGK collision, Guo forcing, shift-streaming.
+- `src/boundary_conditions.cu`: wall bounce-back, pressure inlet/outlet, velocity inlet, outlet treatments.
+- `src/vti_writer.cu`: ASCII VTK ImageData output.
+- `src/main.cu`: CLI, timestep loop, diagnostics, validation metrics.
+- `tools/validate_rect_duct.py`: lightweight helper for summarizing `diagnostics.csv`.
+
+## Boundary-condition modes
+
+The streamwise mode is selected at runtime with `--mode`.
+
+### Mode A
+
+`--mode A`
+
+- periodic in `x`,
+- driven by a constant body force `--force-x`,
+- y/z walls use explicit bounce-back on a wall-node layer.
+
+### Mode B
+
+`--mode B`
+
+- non-periodic `x`,
+- inlet density `--rho-inlet`,
+- outlet density `--rho-outlet`,
+- incoming populations at `x = 0` and `x = Nx - 1` are reconstructed with a local non-equilibrium extrapolation rule.
+
+For the inlet plane the unknown set is `cx > 0`. For the outlet plane the unknown set is `cx < 0`.
+
+### Mode C
+
+`--mode C`
+
+- prescribed inlet velocity at `x = 0`,
+- inlet profile selected with `--inlet-profile uniform|parabolic`,
+- outlet selected with `--outlet extrapolation|zero-gauge-pressure`.
+
+Implemented outlet variants:
+
+- `extrapolation`: incoming outlet populations (`cx < 0`) are copied from the adjacent interior plane.
+- `zero-gauge-pressure`: incoming outlet populations are reconstructed with `rho = rho0`.
+
+## Boundary ordering
+
+Each timestep uses this order:
+
+1. update logical shifts,
+2. collide and stream into the single DF array through the new shifts,
+3. apply wall bounce-back on y/z wall nodes,
+4. apply streamwise inlet/outlet reconstruction for Mode B or Mode C,
+5. recover `rho`, `ux`, `uy`, `uz` for diagnostics and output when requested.
 
 ## Build
+
+CUDA 12+ is expected.
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-The CMake config sets `CMAKE_CUDA_ARCHITECTURES=75` (Turing+) by default.
+Optional single precision:
+
+```bash
+cmake -S . -B build -DLBM_USE_FLOAT=ON
+cmake --build build -j
+```
+
+The project targets `sm_75` and newer by default.
 
 ## Run
 
-```bash
-./build/lbmd3q27 [nx ny nz nsteps output_every]
-```
-
-Example:
+Show options:
 
 ```bash
-./build/lbmd3q27 96 40 32 5000 1000
+./build/lbmd3q27 --help
 ```
 
-This will write files like:
+### Mode A example
 
-- `duct_step_0001000.vti`
-- `duct_step_0002000.vti`
+```bash
+./build/lbmd3q27 \
+  --mode A \
+  --nx 96 --ny 32 --nz 32 \
+  --steps 8000 \
+  --tau 0.8 \
+  --force-x 1e-6 \
+  --diag-every 200 \
+  --output-every 1000 \
+  --output-dir build/mode_a
+```
+
+### Mode B example
+
+```bash
+./build/lbmd3q27 \
+  --mode B \
+  --nx 128 --ny 32 --nz 32 \
+  --steps 10000 \
+  --tau 0.8 \
+  --rho-inlet 1.001 \
+  --rho-outlet 0.999 \
+  --diag-every 200 \
+  --output-every 1000 \
+  --output-dir build/mode_b
+```
+
+### Mode C example
+
+```bash
+./build/lbmd3q27 \
+  --mode C \
+  --nx 128 --ny 32 --nz 32 \
+  --steps 10000 \
+  --tau 0.8 \
+  --inlet-profile parabolic \
+  --inlet-velocity 0.02 \
+  --outlet extrapolation \
+  --diag-every 200 \
+  --output-every 1000 \
+  --output-dir build/mode_c
+```
+
+## Output
+
+The solver writes:
+
+- `duct_step_0000000.vti`,
+- `duct_step_0001000.vti`,
 - ...
+- `diagnostics.csv`.
 
-which can be opened in ParaView.
+The `.vti` files contain:
+
+- `rho`,
+- `ux`,
+- `uy`,
+- `uz`,
+- `velocity` as a 3-component vector.
+
+Open them directly in ParaView as `ImageData`.
+
+## Validation and diagnostics
+
+Console output and `diagnostics.csv` report:
+
+- total mass,
+- mean density,
+- bulk velocity on a representative interior plane,
+- volumetric flow rate,
+- maximum streamwise velocity,
+- residual as the change in bulk velocity between samples,
+- `L2` error,
+- `balance` metric.
+
+Validation metric details:
+
+- Mode A: compares the interior streamwise profile against a rectangular-duct analytical series using the imposed body force.
+- Mode B: compares the interior streamwise profile against the same analytical series using the density-derived pressure gradient.
+- Mode C: compares the inlet plane streamwise velocity against the requested inlet profile.
+
+Balance metric details:
+
+- Mode A: relative total-mass drift against the initial state.
+- Mode B / C: relative inlet/outlet flow-rate mismatch.
+
+Summarize the last recorded diagnostic row:
+
+```bash
+python3 tools/validate_rect_duct.py build/mode_a/diagnostics.csv
+```
+
+## Notes on the wall model
+
+The implementation uses an explicit wall-node layer on the four duct walls in `y` and `z` and performs bounce-back after the streamed logical field has been formed. This keeps the wall treatment compatible with the single-grid periodic-shift storage rule and easy to audit in `src/boundary_conditions.cu`.
+
+## Known practical limits
+
+- This implementation prioritizes clarity and inspectability over aggressive CUDA optimization.
+- The pressure and velocity streamwise boundaries use local non-equilibrium extrapolation style reconstruction rather than a more elaborate higher-order formulation.
+- Because the environment used for this implementation did not provide `nvcc`, the code could not be built locally here; use the build commands above on a CUDA-enabled Linux machine to compile and run it.
