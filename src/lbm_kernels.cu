@@ -13,6 +13,30 @@ __device__ __constant__ Real g_w[kQ];
 #define LBM_LOAD_F_OFFSET(q) const Real f_##q = view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)]
 #define LBM_STORE_F_ALIGNED(q) view.p##q[(cell)] = f_##q
 #define LBM_STORE_F_OFFSET(q) view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = f_##q
+#if defined(LBM_BENCH_COMPUTE_ONLY)
+#define LBM_BENCH_ACCUM_DECL Real bench_checksum = Real(0.0)
+#define LBM_BENCH_ACCUMULATE(value) bench_checksum += (value) * Real(1.0e-30)
+#define LBM_BENCH_FLUSH_ALIGNED() do { if (bench_checksum == Real(-1234567.0)) view.p0[(cell)] = bench_checksum; } while (0)
+#define LBM_BENCH_FLUSH_OFFSET() do { if (bench_checksum == Real(-1234567.0)) view.p0[LBM_VMM_OFFSET_CELL((cell), offset[0], logical_cells)] = bench_checksum; } while (0)
+#else
+#define LBM_BENCH_ACCUM_DECL
+#define LBM_BENCH_ACCUMULATE(value) do { } while (0)
+#define LBM_BENCH_FLUSH_ALIGNED() do { } while (0)
+#define LBM_BENCH_FLUSH_OFFSET() do { } while (0)
+#endif
+
+#if defined(LBM_BENCH_COMPUTE_ONLY)
+#define LBM_COLLIDE_WRITE_ALIGNED(q, value) LBM_BENCH_ACCUMULATE(value)
+#define LBM_COLLIDE_WRITE_OFFSET(q, value) LBM_BENCH_ACCUMULATE(value)
+#else
+#define LBM_COLLIDE_WRITE_ALIGNED(q, value) view.p##q[(cell)] = (value)
+#define LBM_COLLIDE_WRITE_OFFSET(q, value) view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = (value)
+#endif
+
+#if defined(LBM_BENCH_STORE_INPUT)
+#define LBM_COLLIDE_STORE_ALIGNED(q) { view.p##q[(cell)] = f_##q; }
+#define LBM_COLLIDE_STORE_OFFSET(q) { view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = f_##q; }
+#else
 #define LBM_COLLIDE_STORE_ALIGNED(q) \
     { \
         const Real cu = Real(g_cx[(q)]) * ux + Real(g_cy[(q)]) * uy + Real(g_cz[(q)]) * uz; \
@@ -25,7 +49,7 @@ __device__ __constant__ Real g_w[kQ];
         const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[(q)]) * cu * kInvCs4; \
         const Real force_term = g_w[(q)] * (Real(1.0) - Real(0.5) * cfg.omega) * (projection_x * fx + projection_y * fy + projection_z * fz); \
         const Real post_collision = f_##q - cfg.omega * (f_##q - feq) + force_term; \
-        view.p##q[(cell)] = post_collision; \
+        LBM_COLLIDE_WRITE_ALIGNED(q, post_collision); \
     }
 #define LBM_COLLIDE_STORE_OFFSET(q) \
     { \
@@ -39,8 +63,9 @@ __device__ __constant__ Real g_w[kQ];
         const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[(q)]) * cu * kInvCs4; \
         const Real force_term = g_w[(q)] * (Real(1.0) - Real(0.5) * cfg.omega) * (projection_x * fx + projection_y * fy + projection_z * fz); \
         const Real post_collision = f_##q - cfg.omega * (f_##q - feq) + force_term; \
-        view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = post_collision; \
+        LBM_COLLIDE_WRITE_OFFSET(q, post_collision); \
     }
+#endif
 
 namespace {
 
@@ -295,6 +320,9 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
             return;
         }
 
+#if defined(LBM_BENCH_STORE_INPUT)
+        // Memory-path benchmark: preserve the 27 DF writes but skip collision math.
+#else
         const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
         const Real fy = Real(0.0);
         const Real fz = Real(0.0);
@@ -316,6 +344,8 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         const Real uy = (my + Real(0.5) * fy) / rho;
         const Real uz = (mz + Real(0.5) * fz) / rho;
         const Real uu = ux * ux + uy * uy + uz * uz;
+        LBM_BENCH_ACCUM_DECL;
+#endif
 
         LBM_COLLIDE_STORE_OFFSET(0);
         LBM_COLLIDE_STORE_OFFSET(1);
@@ -344,6 +374,9 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         LBM_COLLIDE_STORE_OFFSET(24);
         LBM_COLLIDE_STORE_OFFSET(25);
         LBM_COLLIDE_STORE_OFFSET(26);
+#if !defined(LBM_BENCH_STORE_INPUT)
+        LBM_BENCH_FLUSH_OFFSET();
+#endif
     } else {
         LBM_LOAD_F_ALIGNED(0);
         LBM_LOAD_F_ALIGNED(1);
@@ -405,6 +438,9 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
             return;
         }
 
+#if defined(LBM_BENCH_STORE_INPUT)
+        // Memory-path benchmark: preserve the 27 DF writes but skip collision math.
+#else
         const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
         const Real fy = Real(0.0);
         const Real fz = Real(0.0);
@@ -426,6 +462,8 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         const Real uy = (my + Real(0.5) * fy) / rho;
         const Real uz = (mz + Real(0.5) * fz) / rho;
         const Real uu = ux * ux + uy * uy + uz * uz;
+        LBM_BENCH_ACCUM_DECL;
+#endif
 
         LBM_COLLIDE_STORE_ALIGNED(0);
         LBM_COLLIDE_STORE_ALIGNED(1);
@@ -454,6 +492,9 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         LBM_COLLIDE_STORE_ALIGNED(24);
         LBM_COLLIDE_STORE_ALIGNED(25);
         LBM_COLLIDE_STORE_ALIGNED(26);
+#if !defined(LBM_BENCH_STORE_INPUT)
+        LBM_BENCH_FLUSH_ALIGNED();
+#endif
     }
 }
 

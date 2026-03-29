@@ -1,0 +1,36 @@
+==2021899== NVPROF is profiling process 2021899, command: ./build_modec_default/lbmd3q27 --mode C --nx 128 --ny 64 --nz 64 --steps 20 --tau 0.8 --inlet-profile parabolic --inlet-velocity 0.02 --outlet zero-gauge-pressure --diag-every 20 --output-every 0 --do-not-write-full-volume --output-dir nvprof_modec_defaul
+==2021899== Profiling application: ./build_modec_default/lbmd3q27 --mode C --nx 128 --ny 64 --nz 64 --steps 20 --tau 0.8 --inlet-profile parabolic --inlet-velocity 0.02 --outlet zero-gauge-pressure --diag-every 20 --output-every 0 --do-not-write-full-volume --output-dir nvprof_modec_defaul
+==2021899== Profiling result:
+            Type  Time(%)      Time     Calls       Avg       Min       Max  Name
+ GPU activities:   90.12%  476.08ms        20  23.804ms  19.247ms  31.473ms  __nv_static_36__81832bf5_14_lbm_kernels_cu_0b421b2a__ZN3lbm47_GLOBAL__N__81832bf5_14_lbm_kernels_cu_0b421b2a25collide_and_stream_kernelILb0EEEvNS_13StreamingViewEPKhNS_16SimulationConfigE
+                    3.62%  19.106ms        20  955.32us  380.99us  3.7727ms  __nv_static_44__486e65a1_22_boundary_conditions_cu_656d26ea__ZN3lbm55_GLOBAL__N__486e65a1_22_boundary_conditions_cu_656d26ea32apply_velocity_boundaries_kernelENS_13StreamingViewEPKhNS_16SimulationConfigE
+                    2.11%  11.170ms         2  5.5849ms  4.8739ms  6.2959ms  __nv_static_36__81832bf5_14_lbm_kernels_cu_0b421b2a__ZN3lbm47_GLOBAL__N__81832bf5_14_lbm_kernels_cu_0b421b2a21recover_macros_kernelENS_13StreamingViewEPKhNS_16SimulationConfigEPdS5_S5_S5_
+                    1.93%  10.213ms        20  510.65us  253.09us  2.8706ms  __nv_static_44__486e65a1_22_boundary_conditions_cu_656d26ea__ZN3lbm55_GLOBAL__N__486e65a1_22_boundary_conditions_cu_656d26ea28apply_wall_bounceback_kernelENS_13StreamingViewEPKhNS_16SimulationConfigE
+                    1.30%  6.8733ms         1  6.8733ms  6.8733ms  6.8733ms  __nv_static_36__81832bf5_14_lbm_kernels_cu_0b421b2a__ZN3lbm47_GLOBAL__N__81832bf5_14_lbm_kernels_cu_0b421b2a29initialize_equilibrium_kernelENS_13StreamingViewEPKhNS_16SimulationConfigE
+                    0.90%  4.7589ms         8  594.86us  454.98us  766.18us  [CUDA memcpy DtoH]
+                    0.01%  52.288us         7  7.4690us     320ns  48.736us  [CUDA memcpy HtoD]
+      API calls:   76.86%  526.21ms         4  131.55ms  5.1405ms  506.24ms  cudaDeviceSynchronize
+                   20.75%  142.03ms         5  28.406ms  4.8610us  142.01ms  cudaMemcpyToSymbol
+                    0.93%  6.3690ms        10  636.90us  35.321us  1.0818ms  cudaMemcpy
+                    0.56%  3.8240ms         1  3.8240ms  3.8240ms  3.8240ms  cuMemSetAccess
+                    0.27%  1.8681ms        54  34.594us  27.459us  192.38us  cuMemUnmap
+                    0.16%  1.1242ms         8  140.53us  3.9910us  394.83us  cudaMalloc
+                    0.15%  998.21us        27  36.970us  30.587us  45.479us  cuMemRelease
+                    0.12%  840.64us        27  31.134us  25.044us  128.80us  cuMemCreate
+                    0.09%  632.07us         8  79.008us  7.3930us  146.77us  cudaFree
+                    0.06%  407.35us        63  6.4650us  3.4820us  45.135us  cudaLaunchKernel
+                    0.03%  184.97us       115  1.6080us     131ns  74.848us  cuDeviceGetAttribute
+                    0.01%  66.857us        54  1.2380us     768ns  5.6250us  cuMemMap
+                    0.00%  19.375us         1  19.375us  19.375us  19.375us  cuMemAddressReserve
+                    0.00%  12.699us         1  12.699us  12.699us  12.699us  cuDeviceGetName
+                    0.00%  9.1400us        63     145ns     102ns     409ns  cudaGetLastError
+                    0.00%  7.1900us         1  7.1900us  7.1900us  7.1900us  cuDeviceGetPCIBusId
+                    0.00%  6.4720us         1  6.4720us  6.4720us  6.4720us  cuDeviceTotalMem
+                    0.00%  3.2430us         1  3.2430us  3.2430us  3.2430us  cuInit
+                    0.00%  2.9920us         1  2.9920us  2.9920us  2.9920us  cuMemAddressFree
+                    0.00%  1.3870us         1  1.3870us  1.3870us  1.3870us  cudaGetDevice
+                    0.00%  1.2390us         3     413ns     156ns     803ns  cuDeviceGetCount
+                    0.00%  1.0950us         3     365ns     154ns     624ns  cuDeviceGet
+                    0.00%     398ns         1     398ns     398ns     398ns  cuMemGetAllocationGranularity
+                    0.00%     304ns         1     304ns     304ns     304ns  cuModuleGetLoadingMode
+                    0.00%     197ns         1     197ns     197ns     197ns  cuDeviceGetUuid
