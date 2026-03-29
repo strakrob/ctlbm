@@ -54,20 +54,6 @@ __device__ LBM_FORCEINLINE bool volume_thread_coordinates(
 #endif
 }
 
-__device__ LBM_FORCEINLINE void load_shift_vectors_to_shared(
-    const int* LBM_RESTRICT src_x,
-    const int* LBM_RESTRICT src_y,
-    const int* LBM_RESTRICT src_z,
-    int* LBM_RESTRICT dst_x,
-    int* LBM_RESTRICT dst_y,
-    int* LBM_RESTRICT dst_z) {
-    for (int q = static_cast<int>(threadIdx.x); q < kQ; q += static_cast<int>(blockDim.x)) {
-        dst_x[q] = src_x[q];
-        dst_y[q] = src_y[q];
-        dst_z[q] = src_z[q];
-    }
-}
-
 __device__ LBM_FORCEINLINE Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
     const Real uu = ux * ux + uy * uy + uz * uz;
@@ -210,16 +196,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     const int* LBM_RESTRICT current_sx,
     const int* LBM_RESTRICT current_sy,
     const int* LBM_RESTRICT current_sz) {
-    __shared__ int shared_sx[kQ];
-    __shared__ int shared_sy[kQ];
-    __shared__ int shared_sz[kQ];
-    load_shift_vectors_to_shared(current_sx, current_sy, current_sz, shared_sx, shared_sy, shared_sz);
-    __syncthreads();
-
-    const int nx = cfg.nx;
-    const int ny = cfg.ny;
-    const int nz = cfg.nz;
-    const int cell_count = nx * ny * nz;
+    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     int tid = 0;
     int x = 0;
     int y = 0;
@@ -229,7 +206,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     }
 
     Real populations[kQ];
-    load_logical_cell(f, x, y, z, nx, ny, nz, shared_sx, shared_sy, shared_sz, populations);
+    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz, populations);
 
     const std::uint8_t type = node_type[tid];
 
@@ -239,7 +216,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         // state and then overwritten by dedicated boundary kernels.
         #pragma unroll
         for (int q = 0; q < kQ; ++q) {
-            const int dst = physical_cell_index(q, x, y, z, nx, ny, nz, shared_sx, shared_sy, shared_sz);
+            const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
             f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = populations[q];
         }
         return;
@@ -264,7 +241,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         // current physical slot. The host advances the logical shifts after the
         // kernel, which makes the next logical access observe the streamed
         // neighbour without a second DF array.
-        const int dst = physical_cell_index(q, x, y, z, nx, ny, nz, shared_sx, shared_sy, shared_sz);
+        const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
         f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = post_collision;
     }
 }
