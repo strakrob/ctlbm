@@ -81,7 +81,6 @@ struct DistributionStorage {
     std::array<Real*, lbm::kQ> base{};
     std::array<Real*, lbm::kQ> current{};
     std::array<int, lbm::kQ> offset{};
-    Real** d_population = nullptr;
     int* d_offset = nullptr;
     Real* d_xmin_plane = nullptr;
     Real* d_xmax_plane = nullptr;
@@ -443,7 +442,6 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     const std::size_t node_type_bytes = sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count);
     // The physical DF demand is one population array per D3Q27 direction and
     // no ping-pong copy.
-    const std::size_t pointer_bytes = sizeof(Real*) * static_cast<std::size_t>(lbm::kQ);
     const std::size_t offset_bytes = sizeof(int) * static_cast<std::size_t>(lbm::kQ);
     const std::size_t periodic_plane_bytes =
         2 * sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.ny * cfg.nz);
@@ -453,16 +451,15 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     report.host_bytes =
         node_type_bytes +
         4 * scalar_field_bytes +
-        2 * pointer_bytes +
+        2 * sizeof(Real*) * static_cast<std::size_t>(lbm::kQ) +
         offset_bytes;
 
     // GPU-side persistent buffers: the DF field, four macro fields, the node
-    // type field, and the device copy of the per-population pointer table.
+    // type field, and the offset control table used by padded cases.
     report.gpu_bytes =
         q_field_bytes +
         4 * scalar_field_bytes +
         node_type_bytes +
-        pointer_bytes +
         offset_bytes +
         periodic_plane_bytes;
 
@@ -550,18 +547,8 @@ void initialize_distribution_storage(const SimulationConfig& cfg, DistributionSt
     cu_check(cuMemSetAccess(storage->reservation, reservation_bytes, &access, 1), "set VMM population access");
 
     lbm::cuda_check(
-        cudaMalloc(reinterpret_cast<void**>(&storage->d_population), sizeof(Real*) * static_cast<std::size_t>(lbm::kQ)),
-        "allocate VMM population pointer table");
-    lbm::cuda_check(
         cudaMalloc(reinterpret_cast<void**>(&storage->d_offset), sizeof(int) * static_cast<std::size_t>(lbm::kQ)),
         "allocate VMM population offset table");
-    lbm::cuda_check(
-        cudaMemcpy(
-            storage->d_population,
-            storage->base.data(),
-            sizeof(Real*) * static_cast<std::size_t>(lbm::kQ),
-            cudaMemcpyHostToDevice),
-        "copy VMM population base pointers");
     lbm::cuda_check(
         cudaMemcpy(
             storage->d_offset,
@@ -573,7 +560,33 @@ void initialize_distribution_storage(const SimulationConfig& cfg, DistributionSt
     lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_xmin_plane), periodic_plane_bytes), "allocate periodic xmin plane buffer");
     lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_xmax_plane), periodic_plane_bytes), "allocate periodic xmax plane buffer");
 
-    storage->view.population = storage->d_population;
+    storage->view.p0 = storage->base[0];
+    storage->view.p1 = storage->base[1];
+    storage->view.p2 = storage->base[2];
+    storage->view.p3 = storage->base[3];
+    storage->view.p4 = storage->base[4];
+    storage->view.p5 = storage->base[5];
+    storage->view.p6 = storage->base[6];
+    storage->view.p7 = storage->base[7];
+    storage->view.p8 = storage->base[8];
+    storage->view.p9 = storage->base[9];
+    storage->view.p10 = storage->base[10];
+    storage->view.p11 = storage->base[11];
+    storage->view.p12 = storage->base[12];
+    storage->view.p13 = storage->base[13];
+    storage->view.p14 = storage->base[14];
+    storage->view.p15 = storage->base[15];
+    storage->view.p16 = storage->base[16];
+    storage->view.p17 = storage->base[17];
+    storage->view.p18 = storage->base[18];
+    storage->view.p19 = storage->base[19];
+    storage->view.p20 = storage->base[20];
+    storage->view.p21 = storage->base[21];
+    storage->view.p22 = storage->base[22];
+    storage->view.p23 = storage->base[23];
+    storage->view.p24 = storage->base[24];
+    storage->view.p25 = storage->base[25];
+    storage->view.p26 = storage->base[26];
     storage->view.offset = storage->uses_offset_fallback ? storage->d_offset : nullptr;
     storage->view.logical_cells = static_cast<int>(storage->population_cells);
 }
@@ -614,13 +627,33 @@ void advance_streaming_state(const SimulationConfig& cfg, DistributionStorage* s
         }
     }
 
-    lbm::cuda_check(
-        cudaMemcpy(
-            storage->d_population,
-            storage->current.data(),
-            sizeof(Real*) * static_cast<std::size_t>(lbm::kQ),
-            cudaMemcpyHostToDevice),
-        "update VMM population pointers");
+    storage->view.p0 = storage->current[0];
+    storage->view.p1 = storage->current[1];
+    storage->view.p2 = storage->current[2];
+    storage->view.p3 = storage->current[3];
+    storage->view.p4 = storage->current[4];
+    storage->view.p5 = storage->current[5];
+    storage->view.p6 = storage->current[6];
+    storage->view.p7 = storage->current[7];
+    storage->view.p8 = storage->current[8];
+    storage->view.p9 = storage->current[9];
+    storage->view.p10 = storage->current[10];
+    storage->view.p11 = storage->current[11];
+    storage->view.p12 = storage->current[12];
+    storage->view.p13 = storage->current[13];
+    storage->view.p14 = storage->current[14];
+    storage->view.p15 = storage->current[15];
+    storage->view.p16 = storage->current[16];
+    storage->view.p17 = storage->current[17];
+    storage->view.p18 = storage->current[18];
+    storage->view.p19 = storage->current[19];
+    storage->view.p20 = storage->current[20];
+    storage->view.p21 = storage->current[21];
+    storage->view.p22 = storage->current[22];
+    storage->view.p23 = storage->current[23];
+    storage->view.p24 = storage->current[24];
+    storage->view.p25 = storage->current[25];
+    storage->view.p26 = storage->current[26];
 }
 
 void destroy_distribution_storage(DistributionStorage* storage) {
@@ -629,9 +662,6 @@ void destroy_distribution_storage(DistributionStorage* storage) {
     }
     if (storage->d_xmax_plane != nullptr) {
         lbm::cuda_check(cudaFree(storage->d_xmax_plane), "free periodic xmax plane buffer");
-    }
-    if (storage->d_population != nullptr) {
-        lbm::cuda_check(cudaFree(storage->d_population), "free VMM population pointer table");
     }
     if (storage->d_offset != nullptr) {
         lbm::cuda_check(cudaFree(storage->d_offset), "free VMM population offset table");

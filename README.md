@@ -129,19 +129,6 @@ cmake -S . -B build -DLBM_USE_FLOAT=ON
 cmake --build build -j
 ```
 
-Optional experimental x-major 3D launch topology:
-
-```bash
-cmake -S . -B build -DLBM_USE_3D_TOPOLOGY=ON
-cmake --build build -j
-```
-
-When `LBM_USE_3D_TOPOLOGY=ON`:
-
-- volume kernels use `block = (Nx, 1, 1)`, `grid = (Ny, Nz, 1)`,
-- yz-plane boundary kernels use `block = (Ny, 1, 1)`, `grid = (Nz, 1, 1)`,
-- this requires `Nx <= 1024` and `Ny <= 1024`.
-
 The solver always uses the CUDA virtual-memory streaming backend:
 
 - the solver links the CUDA Driver API and uses `cuMemAddressReserve` /

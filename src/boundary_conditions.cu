@@ -8,33 +8,17 @@ namespace lbm {
 namespace {
 
 __host__ inline void wall_launch_config(const SimulationConfig& cfg, dim3* grid, dim3* block) {
-#if defined(LBM_USE_3D_TOPOLOGY)
-    if (cfg.nx <= 0 || cfg.nx > kCudaMaxThreadsPerBlock) {
-        throw std::runtime_error("LBM_USE_3D_TOPOLOGY requires nx in [1, 1024] for wall kernels.");
-    }
-    *block = dim3(static_cast<unsigned int>(cfg.nx), 1u, 1u);
-    *grid = dim3(static_cast<unsigned int>(cfg.ny), static_cast<unsigned int>(cfg.nz), 1u);
-#else
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int blocks_1d = (cell_count + kBlockSize - 1) / kBlockSize;
     *block = dim3(static_cast<unsigned int>(kBlockSize), 1u, 1u);
     *grid = dim3(static_cast<unsigned int>(blocks_1d), 1u, 1u);
-#endif
 }
 
 __host__ inline void yz_launch_config(const SimulationConfig& cfg, dim3* grid, dim3* block) {
-#if defined(LBM_USE_3D_TOPOLOGY)
-    if (cfg.ny <= 0 || cfg.ny > kCudaMaxThreadsPerBlock) {
-        throw std::runtime_error("LBM_USE_3D_TOPOLOGY requires ny in [1, 1024] for yz-plane kernels.");
-    }
-    *block = dim3(static_cast<unsigned int>(cfg.ny), 1u, 1u);
-    *grid = dim3(static_cast<unsigned int>(cfg.nz), 1u, 1u);
-#else
     const int yz_count = cfg.ny * cfg.nz;
     const int blocks_1d = (yz_count + kBlockSize - 1) / kBlockSize;
     *block = dim3(static_cast<unsigned int>(kBlockSize), 1u, 1u);
     *grid = dim3(static_cast<unsigned int>(blocks_1d), 1u, 1u);
-#endif
 }
 
 __device__ LBM_FORCEINLINE bool wall_thread_coordinates(
@@ -43,16 +27,6 @@ __device__ LBM_FORCEINLINE bool wall_thread_coordinates(
     int* x,
     int* y,
     int* z) {
-#if defined(LBM_USE_3D_TOPOLOGY)
-    *x = static_cast<int>(threadIdx.x);
-    *y = static_cast<int>(blockIdx.x);
-    *z = static_cast<int>(blockIdx.y);
-    if (*x >= cfg.nx || *y >= cfg.ny || *z >= cfg.nz) {
-        return false;
-    }
-    *tid = LBM_FLATTEN_XYZ(*x, *y, *z, cfg.nx, cfg.ny, cfg.nz);
-    return true;
-#else
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     *tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     if (*tid >= cell_count) {
@@ -63,21 +37,12 @@ __device__ LBM_FORCEINLINE bool wall_thread_coordinates(
     *y = yz % cfg.ny;
     *z = yz / cfg.ny;
     return true;
-#endif
 }
 
 __device__ LBM_FORCEINLINE bool yz_thread_coordinates(
     const SimulationConfig& cfg,
     int* y,
     int* z) {
-#if defined(LBM_USE_3D_TOPOLOGY)
-    *y = static_cast<int>(threadIdx.x);
-    *z = static_cast<int>(blockIdx.x);
-    if (*y >= cfg.ny || *z >= cfg.nz) {
-        return false;
-    }
-    return true;
-#else
     const int yz_count = cfg.ny * cfg.nz;
     const int tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     if (tid >= yz_count) {
@@ -86,7 +51,6 @@ __device__ LBM_FORCEINLINE bool yz_thread_coordinates(
     *y = tid % cfg.ny;
     *z = tid / cfg.ny;
     return true;
-#endif
 }
 
 inline int clamp_index(int value, int lo, int hi) {
@@ -125,18 +89,19 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     if (view.offset != nullptr) {
         #pragma unroll
         for (int q = 0; q < kQ; ++q) {
+            Real* const LBM_RESTRICT population = population_pointer(view, q);
             int physical_cell = cell + view.offset[q];
             if (physical_cell >= view.logical_cells) {
                 physical_cell -= view.logical_cells;
             }
-            populations[q] = view.population[q][physical_cell];
+            populations[q] = population[physical_cell];
         }
         return;
     }
 
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        populations[q] = view.population[q][cell];
+        populations[q] = population_pointer(view, q)[cell];
     }
 }
 
@@ -152,15 +117,16 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     Real value) {
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
     if (view.offset != nullptr) {
+        Real* const LBM_RESTRICT population = population_pointer(view, q);
         int physical_cell = cell + view.offset[q];
         if (physical_cell >= view.logical_cells) {
             physical_cell -= view.logical_cells;
         }
-        view.population[q][physical_cell] = value;
+        population[physical_cell] = value;
         return;
     }
 
-    view.population[q][cell] = value;
+    population_pointer(view, q)[cell] = value;
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(

@@ -8,21 +8,47 @@ __device__ __constant__ int g_cz[kQ];
 __device__ __constant__ int g_opp[kQ];
 __device__ __constant__ Real g_w[kQ];
 
+#define LBM_VMM_OFFSET_CELL(cell, offset, logical_cells) (((cell) + (offset) < (logical_cells)) ? ((cell) + (offset)) : ((cell) + (offset) - (logical_cells)))
+#define LBM_LOAD_F_ALIGNED(q) const Real f_##q = view.p##q[(cell)]
+#define LBM_LOAD_F_OFFSET(q) const Real f_##q = view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)]
+#define LBM_STORE_F_ALIGNED(q) view.p##q[(cell)] = f_##q
+#define LBM_STORE_F_OFFSET(q) view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = f_##q
+#define LBM_COLLIDE_STORE_ALIGNED(q) \
+    { \
+        const Real cu = Real(g_cx[(q)]) * ux + Real(g_cy[(q)]) * uy + Real(g_cz[(q)]) * uz; \
+        const Real feq = g_w[(q)] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu); \
+        const Real c_minus_u_x = Real(g_cx[(q)]) - ux; \
+        const Real c_minus_u_y = Real(g_cy[(q)]) - uy; \
+        const Real c_minus_u_z = Real(g_cz[(q)]) - uz; \
+        const Real projection_x = c_minus_u_x * kInvCs2 + Real(g_cx[(q)]) * cu * kInvCs4; \
+        const Real projection_y = c_minus_u_y * kInvCs2 + Real(g_cy[(q)]) * cu * kInvCs4; \
+        const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[(q)]) * cu * kInvCs4; \
+        const Real force_term = g_w[(q)] * (Real(1.0) - Real(0.5) * cfg.omega) * (projection_x * fx + projection_y * fy + projection_z * fz); \
+        const Real post_collision = f_##q - cfg.omega * (f_##q - feq) + force_term; \
+        view.p##q[(cell)] = post_collision; \
+    }
+#define LBM_COLLIDE_STORE_OFFSET(q) \
+    { \
+        const Real cu = Real(g_cx[(q)]) * ux + Real(g_cy[(q)]) * uy + Real(g_cz[(q)]) * uz; \
+        const Real feq = g_w[(q)] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu); \
+        const Real c_minus_u_x = Real(g_cx[(q)]) - ux; \
+        const Real c_minus_u_y = Real(g_cy[(q)]) - uy; \
+        const Real c_minus_u_z = Real(g_cz[(q)]) - uz; \
+        const Real projection_x = c_minus_u_x * kInvCs2 + Real(g_cx[(q)]) * cu * kInvCs4; \
+        const Real projection_y = c_minus_u_y * kInvCs2 + Real(g_cy[(q)]) * cu * kInvCs4; \
+        const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[(q)]) * cu * kInvCs4; \
+        const Real force_term = g_w[(q)] * (Real(1.0) - Real(0.5) * cfg.omega) * (projection_x * fx + projection_y * fy + projection_z * fz); \
+        const Real post_collision = f_##q - cfg.omega * (f_##q - feq) + force_term; \
+        view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = post_collision; \
+    }
+
 namespace {
 
 __host__ inline void volume_launch_config(const SimulationConfig& cfg, dim3* grid, dim3* block) {
-#if defined(LBM_USE_3D_TOPOLOGY)
-    if (cfg.nx <= 0 || cfg.nx > kCudaMaxThreadsPerBlock) {
-        throw std::runtime_error("LBM_USE_3D_TOPOLOGY requires nx in [1, 1024].");
-    }
-    *block = dim3(static_cast<unsigned int>(cfg.nx), 1u, 1u);
-    *grid = dim3(static_cast<unsigned int>(cfg.ny), static_cast<unsigned int>(cfg.nz), 1u);
-#else
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     const int blocks_1d = (cell_count + kBlockSize - 1) / kBlockSize;
     *block = dim3(static_cast<unsigned int>(kBlockSize), 1u, 1u);
     *grid = dim3(static_cast<unsigned int>(blocks_1d), 1u, 1u);
-#endif
 }
 
 __device__ LBM_FORCEINLINE bool volume_thread_coordinates(
@@ -31,16 +57,6 @@ __device__ LBM_FORCEINLINE bool volume_thread_coordinates(
     int* x,
     int* y,
     int* z) {
-#if defined(LBM_USE_3D_TOPOLOGY)
-    *x = static_cast<int>(threadIdx.x);
-    *y = static_cast<int>(blockIdx.x);
-    *z = static_cast<int>(blockIdx.y);
-    if (*x >= cfg.nx || *y >= cfg.ny || *z >= cfg.nz) {
-        return false;
-    }
-    *tid = LBM_FLATTEN_XYZ(*x, *y, *z, cfg.nx, cfg.ny, cfg.nz);
-    return true;
-#else
     const int cell_count = cfg.nx * cfg.ny * cfg.nz;
     *tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     if (*tid >= cell_count) {
@@ -51,26 +67,12 @@ __device__ LBM_FORCEINLINE bool volume_thread_coordinates(
     *y = yz % cfg.ny;
     *z = yz / cfg.ny;
     return true;
-#endif
 }
 
 __device__ LBM_FORCEINLINE Real equilibrium(int q, Real rho, Real ux, Real uy, Real uz) {
     const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
     const Real uu = ux * ux + uy * uy + uz * uz;
     return g_w[q] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu);
-}
-
-__device__ LBM_FORCEINLINE Real guo_force_term(int q, Real ux, Real uy, Real uz, Real fx, Real fy, Real fz, Real omega) {
-    const Real cu = Real(g_cx[q]) * ux + Real(g_cy[q]) * uy + Real(g_cz[q]) * uz;
-    const Real c_minus_u_x = Real(g_cx[q]) - ux;
-    const Real c_minus_u_y = Real(g_cy[q]) - uy;
-    const Real c_minus_u_z = Real(g_cz[q]) - uz;
-
-    const Real projection_x = c_minus_u_x * kInvCs2 + Real(g_cx[q]) * cu * kInvCs4;
-    const Real projection_y = c_minus_u_y * kInvCs2 + Real(g_cy[q]) * cu * kInvCs4;
-    const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[q]) * cu * kInvCs4;
-    const Real forcing_projection = projection_x * fx + projection_y * fy + projection_z * fz;
-    return g_w[q] * (Real(1.0) - Real(0.5) * omega) * forcing_projection;
 }
 
 __device__ LBM_FORCEINLINE void load_logical_cell(
@@ -86,18 +88,19 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     if (view.offset != nullptr) {
         #pragma unroll
         for (int q = 0; q < kQ; ++q) {
+            Real* const LBM_RESTRICT population = population_pointer(view, q);
             int physical_cell = cell + view.offset[q];
             if (physical_cell >= view.logical_cells) {
                 physical_cell -= view.logical_cells;
             }
-            populations[q] = view.population[q][physical_cell];
+            populations[q] = population[physical_cell];
         }
         return;
     }
 
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        populations[q] = view.population[q][cell];
+        populations[q] = population_pointer(view, q)[cell];
     }
 }
 
@@ -113,15 +116,16 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     Real value) {
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
     if (view.offset != nullptr) {
+        Real* const LBM_RESTRICT population = population_pointer(view, q);
         int physical_cell = cell + view.offset[q];
         if (physical_cell >= view.logical_cells) {
             physical_cell -= view.logical_cells;
         }
-        view.population[q][physical_cell] = value;
+        population[physical_cell] = value;
         return;
     }
 
-    view.population[q][cell] = value;
+    population_pointer(view, q)[cell] = value;
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(
@@ -214,6 +218,7 @@ __global__ __launch_bounds__(kLaunchBounds) void initialize_equilibrium_kernel(
     }
 }
 
+template <bool UseOffset>
 __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     StreamingView view,
     const std::uint8_t* LBM_RESTRICT node_type,
@@ -225,43 +230,230 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     if (!volume_thread_coordinates(cfg, &tid, &x, &y, &z)) {
         return;
     }
+    const int cell = tid;
 
-    Real populations[kQ];
-    load_logical_cell(view, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations);
-
-    const std::uint8_t type = node_type[tid];
-
-    if (type != kFluid) {
-        // Walls and explicit inlet/outlet planes are not collided as ordinary
-        // fluid nodes. They are carried forward into the new logical shift
-        // state and then overwritten by dedicated boundary kernels.
-        #pragma unroll
-        for (int q = 0; q < kQ; ++q) {
-            store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations[q]);
+    if constexpr (UseOffset) {
+        const int* LBM_RESTRICT offset = view.offset;
+        const int logical_cells = view.logical_cells;
+        LBM_LOAD_F_OFFSET(0);
+        LBM_LOAD_F_OFFSET(1);
+        LBM_LOAD_F_OFFSET(2);
+        LBM_LOAD_F_OFFSET(3);
+        LBM_LOAD_F_OFFSET(4);
+        LBM_LOAD_F_OFFSET(5);
+        LBM_LOAD_F_OFFSET(6);
+        LBM_LOAD_F_OFFSET(7);
+        LBM_LOAD_F_OFFSET(8);
+        LBM_LOAD_F_OFFSET(9);
+        LBM_LOAD_F_OFFSET(10);
+        LBM_LOAD_F_OFFSET(11);
+        LBM_LOAD_F_OFFSET(12);
+        LBM_LOAD_F_OFFSET(13);
+        LBM_LOAD_F_OFFSET(14);
+        LBM_LOAD_F_OFFSET(15);
+        LBM_LOAD_F_OFFSET(16);
+        LBM_LOAD_F_OFFSET(17);
+        LBM_LOAD_F_OFFSET(18);
+        LBM_LOAD_F_OFFSET(19);
+        LBM_LOAD_F_OFFSET(20);
+        LBM_LOAD_F_OFFSET(21);
+        LBM_LOAD_F_OFFSET(22);
+        LBM_LOAD_F_OFFSET(23);
+        LBM_LOAD_F_OFFSET(24);
+        LBM_LOAD_F_OFFSET(25);
+        LBM_LOAD_F_OFFSET(26);
+        
+        const std::uint8_t type = node_type[tid];
+        if (type != kFluid) {
+            LBM_STORE_F_OFFSET(0);
+            LBM_STORE_F_OFFSET(1);
+            LBM_STORE_F_OFFSET(2);
+            LBM_STORE_F_OFFSET(3);
+            LBM_STORE_F_OFFSET(4);
+            LBM_STORE_F_OFFSET(5);
+            LBM_STORE_F_OFFSET(6);
+            LBM_STORE_F_OFFSET(7);
+            LBM_STORE_F_OFFSET(8);
+            LBM_STORE_F_OFFSET(9);
+            LBM_STORE_F_OFFSET(10);
+            LBM_STORE_F_OFFSET(11);
+            LBM_STORE_F_OFFSET(12);
+            LBM_STORE_F_OFFSET(13);
+            LBM_STORE_F_OFFSET(14);
+            LBM_STORE_F_OFFSET(15);
+            LBM_STORE_F_OFFSET(16);
+            LBM_STORE_F_OFFSET(17);
+            LBM_STORE_F_OFFSET(18);
+            LBM_STORE_F_OFFSET(19);
+            LBM_STORE_F_OFFSET(20);
+            LBM_STORE_F_OFFSET(21);
+            LBM_STORE_F_OFFSET(22);
+            LBM_STORE_F_OFFSET(23);
+            LBM_STORE_F_OFFSET(24);
+            LBM_STORE_F_OFFSET(25);
+            LBM_STORE_F_OFFSET(26);
+            return;
         }
-        return;
-    }
 
-    const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
-    const Real fy = Real(0.0);
-    const Real fz = Real(0.0);
+        const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
+        const Real fy = Real(0.0);
+        const Real fz = Real(0.0);
+        Real rho =
+            f_0 + f_1 + f_2 + f_3 + f_4 + f_5 + f_6 + f_7 + f_8 +
+            f_9 + f_10 + f_11 + f_12 + f_13 + f_14 + f_15 + f_16 + f_17 +
+            f_18 + f_19 + f_20 + f_21 + f_22 + f_23 + f_24 + f_25 + f_26;
+        rho = rho > Real(1.0e-20) ? rho : Real(1.0e-20);
+        const Real mx =
+            f_1 - f_2 + f_7 - f_8 + f_9 - f_10 + f_11 - f_12 + f_13 - f_14 +
+            f_19 - f_20 + f_21 - f_22 + f_23 - f_24 + f_25 - f_26;
+        const Real my =
+            f_3 - f_4 + f_7 - f_8 - f_9 + f_10 + f_15 - f_16 + f_17 - f_18 +
+            f_19 - f_20 + f_21 - f_22 - f_23 + f_24 - f_25 + f_26;
+        const Real mz =
+            f_5 - f_6 + f_11 - f_12 - f_13 + f_14 + f_15 - f_16 - f_17 + f_18 +
+            f_19 - f_20 - f_21 + f_22 + f_23 - f_24 - f_25 + f_26;
+        const Real ux = (mx + Real(0.5) * fx) / rho;
+        const Real uy = (my + Real(0.5) * fy) / rho;
+        const Real uz = (mz + Real(0.5) * fz) / rho;
+        const Real uu = ux * ux + uy * uy + uz * uz;
 
-    Real rho = Real(0.0);
-    Real ux = Real(0.0);
-    Real uy = Real(0.0);
-    Real uz = Real(0.0);
-    recover_macro_from_populations(populations, fx, fy, fz, &rho, &ux, &uy, &uz);
+        LBM_COLLIDE_STORE_OFFSET(0);
+        LBM_COLLIDE_STORE_OFFSET(1);
+        LBM_COLLIDE_STORE_OFFSET(2);
+        LBM_COLLIDE_STORE_OFFSET(3);
+        LBM_COLLIDE_STORE_OFFSET(4);
+        LBM_COLLIDE_STORE_OFFSET(5);
+        LBM_COLLIDE_STORE_OFFSET(6);
+        LBM_COLLIDE_STORE_OFFSET(7);
+        LBM_COLLIDE_STORE_OFFSET(8);
+        LBM_COLLIDE_STORE_OFFSET(9);
+        LBM_COLLIDE_STORE_OFFSET(10);
+        LBM_COLLIDE_STORE_OFFSET(11);
+        LBM_COLLIDE_STORE_OFFSET(12);
+        LBM_COLLIDE_STORE_OFFSET(13);
+        LBM_COLLIDE_STORE_OFFSET(14);
+        LBM_COLLIDE_STORE_OFFSET(15);
+        LBM_COLLIDE_STORE_OFFSET(16);
+        LBM_COLLIDE_STORE_OFFSET(17);
+        LBM_COLLIDE_STORE_OFFSET(18);
+        LBM_COLLIDE_STORE_OFFSET(19);
+        LBM_COLLIDE_STORE_OFFSET(20);
+        LBM_COLLIDE_STORE_OFFSET(21);
+        LBM_COLLIDE_STORE_OFFSET(22);
+        LBM_COLLIDE_STORE_OFFSET(23);
+        LBM_COLLIDE_STORE_OFFSET(24);
+        LBM_COLLIDE_STORE_OFFSET(25);
+        LBM_COLLIDE_STORE_OFFSET(26);
+    } else {
+        LBM_LOAD_F_ALIGNED(0);
+        LBM_LOAD_F_ALIGNED(1);
+        LBM_LOAD_F_ALIGNED(2);
+        LBM_LOAD_F_ALIGNED(3);
+        LBM_LOAD_F_ALIGNED(4);
+        LBM_LOAD_F_ALIGNED(5);
+        LBM_LOAD_F_ALIGNED(6);
+        LBM_LOAD_F_ALIGNED(7);
+        LBM_LOAD_F_ALIGNED(8);
+        LBM_LOAD_F_ALIGNED(9);
+        LBM_LOAD_F_ALIGNED(10);
+        LBM_LOAD_F_ALIGNED(11);
+        LBM_LOAD_F_ALIGNED(12);
+        LBM_LOAD_F_ALIGNED(13);
+        LBM_LOAD_F_ALIGNED(14);
+        LBM_LOAD_F_ALIGNED(15);
+        LBM_LOAD_F_ALIGNED(16);
+        LBM_LOAD_F_ALIGNED(17);
+        LBM_LOAD_F_ALIGNED(18);
+        LBM_LOAD_F_ALIGNED(19);
+        LBM_LOAD_F_ALIGNED(20);
+        LBM_LOAD_F_ALIGNED(21);
+        LBM_LOAD_F_ALIGNED(22);
+        LBM_LOAD_F_ALIGNED(23);
+        LBM_LOAD_F_ALIGNED(24);
+        LBM_LOAD_F_ALIGNED(25);
+        LBM_LOAD_F_ALIGNED(26);
 
-    #pragma unroll
-    for (int q = 0; q < kQ; ++q) {
-        const Real feq = equilibrium(q, rho, ux, uy, uz);
-        const Real force_term = guo_force_term(q, ux, uy, uz, fx, fy, fz, cfg.omega);
-        const Real post_collision = populations[q] - cfg.omega * (populations[q] - feq) + force_term;
-        // In VMM streaming the post-collision value stays in the current
-        // logical slot. The host then advances the per-population start
-        // pointers, so the next logical access observes the streamed neighbour
-        // without a second DF array.
-        store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, post_collision);
+        const std::uint8_t type = node_type[tid];
+        if (type != kFluid) {
+            LBM_STORE_F_ALIGNED(0);
+            LBM_STORE_F_ALIGNED(1);
+            LBM_STORE_F_ALIGNED(2);
+            LBM_STORE_F_ALIGNED(3);
+            LBM_STORE_F_ALIGNED(4);
+            LBM_STORE_F_ALIGNED(5);
+            LBM_STORE_F_ALIGNED(6);
+            LBM_STORE_F_ALIGNED(7);
+            LBM_STORE_F_ALIGNED(8);
+            LBM_STORE_F_ALIGNED(9);
+            LBM_STORE_F_ALIGNED(10);
+            LBM_STORE_F_ALIGNED(11);
+            LBM_STORE_F_ALIGNED(12);
+            LBM_STORE_F_ALIGNED(13);
+            LBM_STORE_F_ALIGNED(14);
+            LBM_STORE_F_ALIGNED(15);
+            LBM_STORE_F_ALIGNED(16);
+            LBM_STORE_F_ALIGNED(17);
+            LBM_STORE_F_ALIGNED(18);
+            LBM_STORE_F_ALIGNED(19);
+            LBM_STORE_F_ALIGNED(20);
+            LBM_STORE_F_ALIGNED(21);
+            LBM_STORE_F_ALIGNED(22);
+            LBM_STORE_F_ALIGNED(23);
+            LBM_STORE_F_ALIGNED(24);
+            LBM_STORE_F_ALIGNED(25);
+            LBM_STORE_F_ALIGNED(26);
+            return;
+        }
+
+        const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
+        const Real fy = Real(0.0);
+        const Real fz = Real(0.0);
+        Real rho =
+            f_0 + f_1 + f_2 + f_3 + f_4 + f_5 + f_6 + f_7 + f_8 +
+            f_9 + f_10 + f_11 + f_12 + f_13 + f_14 + f_15 + f_16 + f_17 +
+            f_18 + f_19 + f_20 + f_21 + f_22 + f_23 + f_24 + f_25 + f_26;
+        rho = rho > Real(1.0e-20) ? rho : Real(1.0e-20);
+        const Real mx =
+            f_1 - f_2 + f_7 - f_8 + f_9 - f_10 + f_11 - f_12 + f_13 - f_14 +
+            f_19 - f_20 + f_21 - f_22 + f_23 - f_24 + f_25 - f_26;
+        const Real my =
+            f_3 - f_4 + f_7 - f_8 - f_9 + f_10 + f_15 - f_16 + f_17 - f_18 +
+            f_19 - f_20 + f_21 - f_22 - f_23 + f_24 - f_25 + f_26;
+        const Real mz =
+            f_5 - f_6 + f_11 - f_12 - f_13 + f_14 + f_15 - f_16 - f_17 + f_18 +
+            f_19 - f_20 - f_21 + f_22 + f_23 - f_24 - f_25 + f_26;
+        const Real ux = (mx + Real(0.5) * fx) / rho;
+        const Real uy = (my + Real(0.5) * fy) / rho;
+        const Real uz = (mz + Real(0.5) * fz) / rho;
+        const Real uu = ux * ux + uy * uy + uz * uz;
+
+        LBM_COLLIDE_STORE_ALIGNED(0);
+        LBM_COLLIDE_STORE_ALIGNED(1);
+        LBM_COLLIDE_STORE_ALIGNED(2);
+        LBM_COLLIDE_STORE_ALIGNED(3);
+        LBM_COLLIDE_STORE_ALIGNED(4);
+        LBM_COLLIDE_STORE_ALIGNED(5);
+        LBM_COLLIDE_STORE_ALIGNED(6);
+        LBM_COLLIDE_STORE_ALIGNED(7);
+        LBM_COLLIDE_STORE_ALIGNED(8);
+        LBM_COLLIDE_STORE_ALIGNED(9);
+        LBM_COLLIDE_STORE_ALIGNED(10);
+        LBM_COLLIDE_STORE_ALIGNED(11);
+        LBM_COLLIDE_STORE_ALIGNED(12);
+        LBM_COLLIDE_STORE_ALIGNED(13);
+        LBM_COLLIDE_STORE_ALIGNED(14);
+        LBM_COLLIDE_STORE_ALIGNED(15);
+        LBM_COLLIDE_STORE_ALIGNED(16);
+        LBM_COLLIDE_STORE_ALIGNED(17);
+        LBM_COLLIDE_STORE_ALIGNED(18);
+        LBM_COLLIDE_STORE_ALIGNED(19);
+        LBM_COLLIDE_STORE_ALIGNED(20);
+        LBM_COLLIDE_STORE_ALIGNED(21);
+        LBM_COLLIDE_STORE_ALIGNED(22);
+        LBM_COLLIDE_STORE_ALIGNED(23);
+        LBM_COLLIDE_STORE_ALIGNED(24);
+        LBM_COLLIDE_STORE_ALIGNED(25);
+        LBM_COLLIDE_STORE_ALIGNED(26);
     }
 }
 
@@ -335,7 +527,11 @@ void launch_collide_and_stream(
     dim3 grid{};
     dim3 block{};
     volume_launch_config(cfg, &grid, &block);
-    collide_and_stream_kernel<<<grid, block>>>(view, d_node_type, cfg);
+    if (view.offset != nullptr) {
+        collide_and_stream_kernel<true><<<grid, block>>>(view, d_node_type, cfg);
+    } else {
+        collide_and_stream_kernel<false><<<grid, block>>>(view, d_node_type, cfg);
+    }
     cuda_check(cudaGetLastError(), "launch collide_and_stream_kernel");
 }
 

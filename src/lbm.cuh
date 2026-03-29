@@ -26,12 +26,7 @@ constexpr int kBlockSize = 64;
 #else
 constexpr int kBlockSize = 128;
 #endif
-#ifdef LBM_USE_3D_TOPOLOGY
-constexpr int kLaunchBounds = 1024;
-#else
 constexpr int kLaunchBounds = kBlockSize;
-#endif
-constexpr int kCudaMaxThreadsPerBlock = 1024;
 constexpr Real kCs2 = Real(1.0 / 3.0);
 constexpr Real kInvCs2 = Real(3.0);
 constexpr Real kInvCs4 = Real(9.0);
@@ -102,10 +97,69 @@ struct SimulationConfig {
 };
 
 struct StreamingView {
-    Real* const* population = nullptr;
+    Real* p0 = nullptr;
+    Real* p1 = nullptr;
+    Real* p2 = nullptr;
+    Real* p3 = nullptr;
+    Real* p4 = nullptr;
+    Real* p5 = nullptr;
+    Real* p6 = nullptr;
+    Real* p7 = nullptr;
+    Real* p8 = nullptr;
+    Real* p9 = nullptr;
+    Real* p10 = nullptr;
+    Real* p11 = nullptr;
+    Real* p12 = nullptr;
+    Real* p13 = nullptr;
+    Real* p14 = nullptr;
+    Real* p15 = nullptr;
+    Real* p16 = nullptr;
+    Real* p17 = nullptr;
+    Real* p18 = nullptr;
+    Real* p19 = nullptr;
+    Real* p20 = nullptr;
+    Real* p21 = nullptr;
+    Real* p22 = nullptr;
+    Real* p23 = nullptr;
+    Real* p24 = nullptr;
+    Real* p25 = nullptr;
+    Real* p26 = nullptr;
     const int* offset = nullptr;
     int logical_cells = 0;
 };
+
+__host__ __device__ LBM_FORCEINLINE Real* population_pointer(const StreamingView& view, int q) {
+    switch (q) {
+        case 0: return view.p0;
+        case 1: return view.p1;
+        case 2: return view.p2;
+        case 3: return view.p3;
+        case 4: return view.p4;
+        case 5: return view.p5;
+        case 6: return view.p6;
+        case 7: return view.p7;
+        case 8: return view.p8;
+        case 9: return view.p9;
+        case 10: return view.p10;
+        case 11: return view.p11;
+        case 12: return view.p12;
+        case 13: return view.p13;
+        case 14: return view.p14;
+        case 15: return view.p15;
+        case 16: return view.p16;
+        case 17: return view.p17;
+        case 18: return view.p18;
+        case 19: return view.p19;
+        case 20: return view.p20;
+        case 21: return view.p21;
+        case 22: return view.p22;
+        case 23: return view.p23;
+        case 24: return view.p24;
+        case 25: return view.p25;
+        case 26: return view.p26;
+    }
+    return nullptr;
+}
 
 inline constexpr std::array<int, kQ> kCx = {
     0,

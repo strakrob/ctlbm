@@ -10,7 +10,7 @@
   --diag-every 100 \
   --do-not-write-full-volume \
   --write-cross-sections \
-  --output-every 500 \
+  --output-every 0 \
   --output-dir build/mode_c \
   --write-node-map
 
