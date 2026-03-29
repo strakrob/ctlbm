@@ -1,8 +1,12 @@
 #pragma once
 
+#if defined(LBM_USE_VMM_STREAMING)
+#include <cuda.h>
+#endif
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -49,6 +53,11 @@ constexpr Real kInvCs4 = Real(9.0);
 // Streaming is expressed purely by changing per-direction logical shifts.
 // A logical access (q, x, y, z) is translated to a physical cell index with
 // `physical_cell_index`, so reviewers can verify that no second DF field exists.
+//
+// When LBM_USE_VMM_STREAMING is enabled, the same one-array-per-population SoA
+// design is kept, but each population array is mapped twice into one virtual
+// address reservation. The control structure then becomes an array of
+// per-population start pointers instead of per-population x/y/z shift vectors.
 
 enum class StreamwiseMode : int {
     PeriodicBodyForce = 0,
@@ -97,6 +106,17 @@ struct SimulationConfig {
     StreamwiseMode mode = StreamwiseMode::PeriodicBodyForce;
     OutletMode outlet_mode = OutletMode::Extrapolation;
     InletProfile inlet_profile = InletProfile::Parabolic;
+};
+
+struct StreamingView {
+#if defined(LBM_USE_VMM_STREAMING)
+    Real* const* population = nullptr;
+#else
+    Real* population = nullptr;
+    const int* sx = nullptr;
+    const int* sy = nullptr;
+    const int* sz = nullptr;
+#endif
 };
 
 inline constexpr std::array<int, kQ> kCx = {
@@ -182,6 +202,10 @@ __host__ __device__ LBM_FORCEINLINE int distribution_index(int q, int cell, int 
     return LBM_DISTRIBUTION_INDEX(q, cell, cell_count);
 }
 
+inline int streaming_linear_offset(int q, const SimulationConfig& cfg) {
+    return kCx[q] + kCy[q] * cfg.nx + kCz[q] * cfg.nx * cfg.ny;
+}
+
 __host__ __device__ LBM_FORCEINLINE int physical_cell_index(
     int q,
     int x,
@@ -221,52 +245,39 @@ void copy_lattice_constants_to_device();
 
 void launch_classify_nodes(std::uint8_t* d_node_type, const SimulationConfig& cfg);
 void launch_initialize_equilibrium(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz);
+    const SimulationConfig& cfg);
 void launch_collide_and_stream(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz);
+    const SimulationConfig& cfg);
 void launch_recover_macros(
-    const Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
     const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz,
     Real* d_rho,
     Real* d_ux,
     Real* d_uy,
     Real* d_uz);
 
 void launch_apply_wall_boundaries(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
+    const SimulationConfig& cfg);
+void launch_apply_periodic_x_boundaries(
+    StreamingView view,
     const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz);
+    Real* d_xmin_plane,
+    Real* d_xmax_plane);
 void launch_apply_pressure_boundaries(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz);
+    const SimulationConfig& cfg);
 void launch_apply_velocity_boundaries(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz);
+    const SimulationConfig& cfg);
 
 void build_default_node_type_map(std::vector<std::uint8_t>* node_type, const SimulationConfig& cfg);
 

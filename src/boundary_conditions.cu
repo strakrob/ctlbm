@@ -113,27 +113,32 @@ __device__ LBM_FORCEINLINE Real equilibrium(int q, Real rho, Real ux, Real uy, R
 }
 
 __device__ LBM_FORCEINLINE void load_logical_cell(
-    const Real* LBM_RESTRICT f,
+    StreamingView view,
     int x,
     int y,
     int z,
     int nx,
     int ny,
     int nz,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz,
     Real* LBM_RESTRICT populations) {
+#if defined(LBM_USE_VMM_STREAMING)
+    const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    #pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        populations[q] = view.population[q][cell];
+    }
+#else
     const int cell_count = nx * ny * nz;
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-        populations[q] = f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)];
+        const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
+        populations[q] = view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)];
     }
+#endif
 }
 
 __device__ LBM_FORCEINLINE void store_logical_population(
-    Real* LBM_RESTRICT f,
+    StreamingView view,
     int q,
     int x,
     int y,
@@ -141,13 +146,15 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     int nx,
     int ny,
     int nz,
-    const int* sx,
-    const int* sy,
-    const int* sz,
     Real value) {
+#if defined(LBM_USE_VMM_STREAMING)
+    const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    view.population[q][cell] = value;
+#else
     const int cell_count = nx * ny * nz;
-    const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-    f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)] = value;
+    const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
+    view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)] = value;
+#endif
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(
@@ -179,13 +186,9 @@ __device__ LBM_FORCEINLINE void recover_macro_from_populations(
 }
 
 __global__ __launch_bounds__(kLaunchBounds) void apply_wall_bounceback_kernel(
-    Real* LBM_RESTRICT f,
+    StreamingView view,
     const std::uint8_t* LBM_RESTRICT node_type,
-    SimulationConfig cfg,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    SimulationConfig cfg) {
     int tid = 0;
     int x = 0;
     int y = 0;
@@ -198,25 +201,21 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_wall_bounceback_kernel(
     }
 
     Real populations[kQ];
-    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, populations);
+    load_logical_cell(view, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations);
 
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         // The wall layer is explicit. After the streamed field exists in logical
         // form, swapping q with opp(q) on wall nodes reflects populations back
         // toward adjacent fluid nodes using the same single DF storage.
-        const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz);
-        f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = populations[g_opp[q]];
+        store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations[g_opp[q]]);
     }
 }
 
 __global__ __launch_bounds__(kLaunchBounds) void apply_pressure_boundaries_kernel(
-    Real* LBM_RESTRICT f,
+    StreamingView view,
     const std::uint8_t* LBM_RESTRICT node_type,
-    SimulationConfig cfg,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz) {
+    SimulationConfig cfg) {
     int y = 0;
     int z = 0;
     if (!yz_thread_coordinates(cfg, &y, &z)) {
@@ -231,7 +230,7 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_pressure_boundaries_kerne
 
     if (node_type[inlet_tid] == kInlet) {
         Real interior[kQ];
-        load_logical_cell(f, 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior);
+        load_logical_cell(view, 1, y, z, cfg.nx, cfg.ny, cfg.nz, interior);
 
         Real rho_i = Real(0.0);
         Real ux_i = Real(0.0);
@@ -247,13 +246,13 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_pressure_boundaries_kerne
             // removed from all boundary populations.
             const Real feq_boundary = equilibrium(q, cfg.rho_inlet, ux_i, uy_i, uz_i);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(view, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
     if (node_type[outlet_tid] == kOutlet) {
         Real interior[kQ];
-        load_logical_cell(f, cfg.nx - 2, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior);
+        load_logical_cell(view, cfg.nx - 2, y, z, cfg.nx, cfg.ny, cfg.nz, interior);
 
         Real rho_i = Real(0.0);
         Real ux_i = Real(0.0);
@@ -265,18 +264,71 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_pressure_boundaries_kerne
         for (int q = 0; q < kQ; ++q) {
             const Real feq_boundary = equilibrium(q, cfg.rho_outlet, ux_i, uy_i, uz_i);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(view, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 }
 
-__global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kernel(
-    Real* LBM_RESTRICT f,
-    const std::uint8_t* LBM_RESTRICT node_type,
+#if defined(LBM_USE_VMM_STREAMING)
+__global__ __launch_bounds__(kLaunchBounds) void gather_periodic_x_planes_kernel(
+    StreamingView view,
     SimulationConfig cfg,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz) {
+    Real* LBM_RESTRICT xmin_plane,
+    Real* LBM_RESTRICT xmax_plane) {
+    int y = 0;
+    int z = 0;
+    if (!yz_thread_coordinates(cfg, &y, &z)) {
+        return;
+    }
+    if (y == 0 || y == cfg.ny - 1 || z == 0 || z == cfg.nz - 1) {
+        return;
+    }
+
+    const int yz_count = cfg.ny * cfg.nz;
+    const int yz_cell = z * cfg.ny + y;
+    Real xmin_pop[kQ];
+    Real xmax_pop[kQ];
+    load_logical_cell(view, 0, y + 1, z, cfg.nx, cfg.ny, cfg.nz, xmin_pop);
+    load_logical_cell(view, cfg.nx - 1, y - 1, z, cfg.nx, cfg.ny, cfg.nz, xmax_pop);
+
+    #pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        xmin_plane[q * yz_count + yz_cell] = (g_cx[q] > 0) ? xmin_pop[q] : view.population[q][LBM_FLATTEN_XYZ(0, y, z, cfg.nx, cfg.ny, cfg.nz)];
+        xmax_plane[q * yz_count + yz_cell] = (g_cx[q] < 0) ? xmax_pop[q] : view.population[q][LBM_FLATTEN_XYZ(cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz)];
+    }
+}
+
+__global__ __launch_bounds__(kLaunchBounds) void scatter_periodic_x_planes_kernel(
+    StreamingView view,
+    SimulationConfig cfg,
+    const Real* LBM_RESTRICT xmin_plane,
+    const Real* LBM_RESTRICT xmax_plane) {
+    int y = 0;
+    int z = 0;
+    if (!yz_thread_coordinates(cfg, &y, &z)) {
+        return;
+    }
+    if (y == 0 || y == cfg.ny - 1 || z == 0 || z == cfg.nz - 1) {
+        return;
+    }
+
+    const int yz_count = cfg.ny * cfg.nz;
+    const int yz_cell = z * cfg.ny + y;
+    #pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        if (g_cx[q] > 0) {
+            store_logical_population(view, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, xmin_plane[q * yz_count + yz_cell]);
+        } else if (g_cx[q] < 0) {
+            store_logical_population(view, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, xmax_plane[q * yz_count + yz_cell]);
+        }
+    }
+}
+#endif
+
+__global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kernel(
+    StreamingView view,
+    const std::uint8_t* LBM_RESTRICT node_type,
+    SimulationConfig cfg) {
     int y = 0;
     int z = 0;
     if (!yz_thread_coordinates(cfg, &y, &z)) {
@@ -291,7 +343,7 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kerne
 
     if (node_type[inlet_tid] == kInlet) {
         Real interior[kQ];
-        load_logical_cell(f, 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior);
+        load_logical_cell(view, 1, y, z, cfg.nx, cfg.ny, cfg.nz, interior);
 
         Real rho_i = Real(0.0);
         Real ux_i = Real(0.0);
@@ -311,7 +363,7 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kerne
             // self-consistent inlet state.
             const Real feq_boundary = equilibrium(q, rho_b, ux_b, uy_b, uz_b);
             const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-            store_logical_population(f, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+            store_logical_population(view, q, 0, y, z, cfg.nx, cfg.ny, cfg.nz, feq_boundary + (interior[q] - feq_interior));
         }
     }
 
@@ -320,14 +372,14 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kerne
     }
 
     Real interior[kQ];
-    load_logical_cell(f, cfg.nx - 2, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior);
+    load_logical_cell(view, cfg.nx - 2, y, z, cfg.nx, cfg.ny, cfg.nz, interior);
 
     if (cfg.outlet_mode == OutletMode::Extrapolation) {
         #pragma unroll
         for (int q = 0; q < kQ; ++q) {
             // Extrapolation outlet: use the full adjacent interior state on the
             // boundary plane to avoid retaining stale wrapped populations.
-            store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, interior[q]);
+            store_logical_population(view, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, interior[q]);
         }
         return;
     }
@@ -342,51 +394,63 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kerne
     for (int q = 0; q < kQ; ++q) {
         const Real feq_boundary = equilibrium(q, cfg.rho0, ux_i, uy_i, uz_i);
         const Real feq_interior = equilibrium(q, rho_i, ux_i, uy_i, uz_i);
-        store_logical_population(f, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, feq_boundary + (interior[q] - feq_interior));
+        store_logical_population(view, q, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, feq_boundary + (interior[q] - feq_interior));
     }
 }
 
 }  // namespace
 
 void launch_apply_wall_boundaries(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz) {
+    const SimulationConfig& cfg) {
     dim3 grid{};
     dim3 block{};
     wall_launch_config(cfg, &grid, &block);
-    apply_wall_bounceback_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    apply_wall_bounceback_kernel<<<grid, block>>>(view, d_node_type, cfg);
     cuda_check(cudaGetLastError(), "launch apply_wall_bounceback_kernel");
 }
 
 void launch_apply_pressure_boundaries(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz) {
+    const SimulationConfig& cfg) {
     dim3 grid{};
     dim3 block{};
     yz_launch_config(cfg, &grid, &block);
-    apply_pressure_boundaries_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    apply_pressure_boundaries_kernel<<<grid, block>>>(view, d_node_type, cfg);
     cuda_check(cudaGetLastError(), "launch apply_pressure_boundaries_kernel");
 }
 
-void launch_apply_velocity_boundaries(
-    Real* d_f,
-    const std::uint8_t* d_node_type,
+void launch_apply_periodic_x_boundaries(
+    StreamingView view,
     const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz) {
+    Real* d_xmin_plane,
+    Real* d_xmax_plane) {
+#if defined(LBM_USE_VMM_STREAMING)
     dim3 grid{};
     dim3 block{};
     yz_launch_config(cfg, &grid, &block);
-    apply_velocity_boundaries_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    gather_periodic_x_planes_kernel<<<grid, block>>>(view, cfg, d_xmin_plane, d_xmax_plane);
+    cuda_check(cudaGetLastError(), "launch gather_periodic_x_planes_kernel");
+    scatter_periodic_x_planes_kernel<<<grid, block>>>(view, cfg, d_xmin_plane, d_xmax_plane);
+    cuda_check(cudaGetLastError(), "launch scatter_periodic_x_planes_kernel");
+#else
+    (void)view;
+    (void)cfg;
+    (void)d_xmin_plane;
+    (void)d_xmax_plane;
+#endif
+}
+
+void launch_apply_velocity_boundaries(
+    StreamingView view,
+    const std::uint8_t* d_node_type,
+    const SimulationConfig& cfg) {
+    dim3 grid{};
+    dim3 block{};
+    yz_launch_config(cfg, &grid, &block);
+    apply_velocity_boundaries_kernel<<<grid, block>>>(view, d_node_type, cfg);
     cuda_check(cudaGetLastError(), "launch apply_velocity_boundaries_kernel");
 }
 

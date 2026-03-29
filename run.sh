@@ -1,7 +1,7 @@
 #!/bin/bash
 ./build/lbmd3q27 \
   --mode C \
-  --nx 256 --ny 64 --nz 64 \
+  --nx 128 --ny 64 --nz 32 \
   --steps 1000 \
   --tau 0.8 \
   --inlet-profile parabolic \

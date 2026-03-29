@@ -20,7 +20,7 @@ It does **not** use:
 - source/destination swaps,
 - pull/push double buffering.
 
-Instead, each population `q` carries cumulative logical shifts `sx[q]`, `sy[q]`, `sz[q]`. A logical access to `(q, x, y, z)` is mapped to physical storage by:
+By default, each population `q` carries cumulative logical shifts `sx[q]`, `sy[q]`, `sz[q]`. A logical access to `(q, x, y, z)` is mapped to physical storage by:
 
 ```text
 physical_x = wrap(x - sx[q], Nx)
@@ -43,6 +43,14 @@ The collision kernel then:
 3. writes the post-collision state back through the new shifts.
 
 That write is the streamed state at `t + 1`, still inside the same DF array.
+
+An optional compile-time backend, `-DLBM_USE_VMM_STREAMING=ON`, replaces the
+shift vectors with CUDA virtual-memory-mapped per-population start pointers.
+Each D3Q27 population array is mapped twice into one reserved GPU virtual
+address range, and the host advances those pointers by the linear D3Q27 offset
+after each timestep. Because the solver still uses the explicit rectangular
+`(x, y, z)` indexing elsewhere, the Mode A VMM path applies an additional
+periodic `x`-plane repair before the wall bounce-back kernel.
 
 ## Source layout
 
@@ -93,9 +101,10 @@ Each timestep uses this order:
 
 1. collide and stream in place while reading and writing through the current logical shifts,
 2. advance the logical shifts on the host,
-3. apply wall bounce-back on y/z wall nodes,
-4. apply streamwise inlet/outlet reconstruction for Mode B or Mode C,
-5. recover `rho`, `ux`, `uy`, `uz` for diagnostics and output when requested.
+3. when `LBM_USE_VMM_STREAMING=ON` and Mode A is active, repair the periodic `x` planes,
+4. apply wall bounce-back on y/z wall nodes,
+5. apply streamwise inlet/outlet reconstruction for Mode B or Mode C,
+6. recover `rho`, `ux`, `uy`, `uz` for diagnostics and output when requested.
 
 ## Geometry stamping
 
@@ -144,6 +153,24 @@ When `LBM_USE_3D_TOPOLOGY=ON`:
 - volume kernels use `block = (Nx, 1, 1)`, `grid = (Ny, Nz, 1)`,
 - yz-plane boundary kernels use `block = (Ny, 1, 1)`, `grid = (Nz, 1, 1)`,
 - this requires `Nx <= 1024` and `Ny <= 1024`.
+
+Optional CUDA virtual-memory streaming backend:
+
+```bash
+cmake -S . -B build -DLBM_USE_VMM_STREAMING=ON
+cmake --build build -j
+```
+
+When `LBM_USE_VMM_STREAMING=ON`:
+
+- the solver links the CUDA Driver API and uses `cuMemAddressReserve` /
+  `cuMemCreate` / `cuMemMap` for the population arrays,
+- runtime startup prints the actual GPU VMM granularity,
+- each per-population byte size, `Nx * Ny * Nz * sizeof(Real)`, must be an
+  exact multiple of that granularity or startup will fail with an explicit
+  error,
+- two temporary `yz` plane buffers are allocated on the GPU for the Mode A
+  periodic `x`-plane repair step.
 
 The project targets `sm_75` and newer by default.
 

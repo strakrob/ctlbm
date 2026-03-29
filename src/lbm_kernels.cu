@@ -74,24 +74,49 @@ __device__ LBM_FORCEINLINE Real guo_force_term(int q, Real ux, Real uy, Real uz,
 }
 
 __device__ LBM_FORCEINLINE void load_logical_cell(
-    const Real* LBM_RESTRICT f,
+    StreamingView view,
     int x,
     int y,
     int z,
     int nx,
     int ny,
     int nz,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz,
     Real* LBM_RESTRICT populations) {
+#if defined(LBM_USE_VMM_STREAMING)
+    const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    #pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        populations[q] = view.population[q][cell];
+    }
+#else
     const int cell_count = nx * ny * nz;
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         // The logical field for direction q is stored with its own running shift.
-        const int cell = physical_cell_index(q, x, y, z, nx, ny, nz, sx, sy, sz);
-        populations[q] = f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)];
+        const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
+        populations[q] = view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)];
     }
+#endif
+}
+
+__device__ LBM_FORCEINLINE void store_logical_population(
+    StreamingView view,
+    int q,
+    int x,
+    int y,
+    int z,
+    int nx,
+    int ny,
+    int nz,
+    Real value) {
+#if defined(LBM_USE_VMM_STREAMING)
+    const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    view.population[q][cell] = value;
+#else
+    const int cell_count = nx * ny * nz;
+    const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
+    view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)] = value;
+#endif
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(
@@ -152,13 +177,9 @@ __global__ __launch_bounds__(kLaunchBounds) void classify_nodes_kernel(std::uint
 }
 
 __global__ __launch_bounds__(kLaunchBounds) void initialize_equilibrium_kernel(
-    Real* LBM_RESTRICT f,
+    StreamingView view,
     const std::uint8_t* LBM_RESTRICT node_type,
-    SimulationConfig cfg,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    SimulationConfig cfg) {
     int tid = 0;
     int x = 0;
     int y = 0;
@@ -184,19 +205,14 @@ __global__ __launch_bounds__(kLaunchBounds) void initialize_equilibrium_kernel(
 
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        const int cell = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz);
-        f[LBM_DISTRIBUTION_INDEX(q, cell, cell_count)] = equilibrium(q, rho, ux, uy, uz);
+        store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, equilibrium(q, rho, ux, uy, uz));
     }
 }
 
 __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
-    Real* LBM_RESTRICT f,
+    StreamingView view,
     const std::uint8_t* LBM_RESTRICT node_type,
-    SimulationConfig cfg,
-    const int* LBM_RESTRICT current_sx,
-    const int* LBM_RESTRICT current_sy,
-    const int* LBM_RESTRICT current_sz) {
-    const int cell_count = cfg.nx * cfg.ny * cfg.nz;
+    SimulationConfig cfg) {
     int tid = 0;
     int x = 0;
     int y = 0;
@@ -206,7 +222,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     }
 
     Real populations[kQ];
-    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz, populations);
+    load_logical_cell(view, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations);
 
     const std::uint8_t type = node_type[tid];
 
@@ -216,8 +232,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         // state and then overwritten by dedicated boundary kernels.
         #pragma unroll
         for (int q = 0; q < kQ; ++q) {
-            const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
-            f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = populations[q];
+            store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations[q]);
         }
         return;
     }
@@ -238,21 +253,17 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         const Real force_term = guo_force_term(q, ux, uy, uz, fx, fy, fz, cfg.omega);
         const Real post_collision = populations[q] - cfg.omega * (populations[q] - feq) + force_term;
         // In periodic-shift streaming the post-collision value stays in the
-        // current physical slot. The host advances the logical shifts after the
-        // kernel, which makes the next logical access observe the streamed
-        // neighbour without a second DF array.
-        const int dst = physical_cell_index(q, x, y, z, cfg.nx, cfg.ny, cfg.nz, current_sx, current_sy, current_sz);
-        f[LBM_DISTRIBUTION_INDEX(q, dst, cell_count)] = post_collision;
+        // current logical slot. The host then advances either the per-direction
+        // shifts or the per-population VMM base pointers, so the next logical
+        // access observes the streamed neighbour without a second DF array.
+        store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, post_collision);
     }
 }
 
 __global__ __launch_bounds__(kLaunchBounds) void recover_macros_kernel(
-    const Real* LBM_RESTRICT f,
+    StreamingView view,
     const std::uint8_t* LBM_RESTRICT node_type,
     SimulationConfig cfg,
-    const int* LBM_RESTRICT sx,
-    const int* LBM_RESTRICT sy,
-    const int* LBM_RESTRICT sz,
     Real* LBM_RESTRICT rho,
     Real* LBM_RESTRICT ux,
     Real* LBM_RESTRICT uy,
@@ -266,7 +277,7 @@ __global__ __launch_bounds__(kLaunchBounds) void recover_macros_kernel(
     }
 
     Real populations[kQ];
-    load_logical_cell(f, x, y, z, cfg.nx, cfg.ny, cfg.nz, sx, sy, sz, populations);
+    load_logical_cell(view, x, y, z, cfg.nx, cfg.ny, cfg.nz, populations);
 
     const std::uint8_t type = node_type[tid];
     const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce && type != kWall) ? cfg.body_force_x : Real(0.0);
@@ -302,40 +313,31 @@ void launch_classify_nodes(std::uint8_t* d_node_type, const SimulationConfig& cf
 }
 
 void launch_initialize_equilibrium(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz) {
+    const SimulationConfig& cfg) {
     dim3 grid{};
     dim3 block{};
     volume_launch_config(cfg, &grid, &block);
-    initialize_equilibrium_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    initialize_equilibrium_kernel<<<grid, block>>>(view, d_node_type, cfg);
     cuda_check(cudaGetLastError(), "launch initialize_equilibrium_kernel");
 }
 
 void launch_collide_and_stream(
-    Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
-    const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz) {
+    const SimulationConfig& cfg) {
     dim3 grid{};
     dim3 block{};
     volume_launch_config(cfg, &grid, &block);
-    collide_and_stream_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+    collide_and_stream_kernel<<<grid, block>>>(view, d_node_type, cfg);
     cuda_check(cudaGetLastError(), "launch collide_and_stream_kernel");
 }
 
 void launch_recover_macros(
-    const Real* d_f,
+    StreamingView view,
     const std::uint8_t* d_node_type,
     const SimulationConfig& cfg,
-    const int* d_sx,
-    const int* d_sy,
-    const int* d_sz,
     Real* d_rho,
     Real* d_ux,
     Real* d_uy,
@@ -343,7 +345,7 @@ void launch_recover_macros(
     dim3 grid{};
     dim3 block{};
     volume_launch_config(cfg, &grid, &block);
-    recover_macros_kernel<<<grid, block>>>(d_f, d_node_type, cfg, d_sx, d_sy, d_sz, d_rho, d_ux, d_uy, d_uz);
+    recover_macros_kernel<<<grid, block>>>(view, d_node_type, cfg, d_rho, d_ux, d_uy, d_uz);
     cuda_check(cudaGetLastError(), "launch recover_macros_kernel");
 }
 

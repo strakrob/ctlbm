@@ -69,6 +69,30 @@ struct MemoryReport {
     double total_bytes_per_cell = 0.0;
 };
 
+struct DistributionStorage {
+    lbm::StreamingView view{};
+#if defined(LBM_USE_VMM_STREAMING)
+    CUdeviceptr reservation = 0;
+    std::size_t population_bytes = 0;
+    std::size_t population_cells = 0;
+    std::size_t granularity_bytes = 0;
+    std::array<CUmemGenericAllocationHandle, lbm::kQ> handles{};
+    std::array<Real*, lbm::kQ> base{};
+    std::array<Real*, lbm::kQ> current{};
+    Real** d_population = nullptr;
+    Real* d_xmin_plane = nullptr;
+    Real* d_xmax_plane = nullptr;
+#else
+    Real* d_field = nullptr;
+    int* d_sx = nullptr;
+    int* d_sy = nullptr;
+    int* d_sz = nullptr;
+    std::array<int, lbm::kQ> shift_x{};
+    std::array<int, lbm::kQ> shift_y{};
+    std::array<int, lbm::kQ> shift_z{};
+#endif
+};
+
 std::string to_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
@@ -98,6 +122,14 @@ std::string format_bytes(std::size_t bytes) {
     std::ostringstream os;
     os << bytes << " B (" << std::fixed << std::setprecision(3) << (static_cast<double>(bytes) / (1024.0 * 1024.0)) << " MiB)";
     return os.str();
+}
+
+std::string streaming_backend_name() {
+#if defined(LBM_USE_VMM_STREAMING)
+    return "cuda-vmm";
+#else
+    return "logical-shifts";
+#endif
 }
 
 [[noreturn]] void usage_and_exit(const char* program) {
@@ -413,27 +445,35 @@ void update_mlups_stats(MlupsStats* mlups, int step, int cell_count, Diagnostics
     diagnostics->mlups_max = static_cast<Real>(mlups->max_mlups);
 }
 
-void update_shift_vectors(
-    const SimulationConfig& cfg,
-    std::array<int, lbm::kQ>* sx,
-    std::array<int, lbm::kQ>* sy,
-    std::array<int, lbm::kQ>* sz) {
-    // After collide-and-stream has written into the next logical shift layout,
-    // the host advances the cumulative offsets so all subsequent accesses use
-    // that new streamed state.
-    for (int q = 0; q < lbm::kQ; ++q) {
-        (*sx)[q] = lbm::advance_shift_index((*sx)[q], lbm::kCx[q], cfg.nx);
-        (*sy)[q] = lbm::advance_shift_index((*sy)[q], lbm::kCy[q], cfg.ny);
-        (*sz)[q] = lbm::advance_shift_index((*sz)[q], lbm::kCz[q], cfg.nz);
-    }
-}
-
-MemoryReport build_memory_report(int cell_count) {
+MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     MemoryReport report;
 
     const std::size_t q_field_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cell_count);
     const std::size_t scalar_field_bytes = sizeof(Real) * static_cast<std::size_t>(cell_count);
     const std::size_t node_type_bytes = sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count);
+    // The physical DF demand is unchanged across both streaming backends:
+    // one population array per D3Q27 direction and no ping-pong copy.
+#if defined(LBM_USE_VMM_STREAMING)
+    const std::size_t pointer_bytes = sizeof(Real*) * static_cast<std::size_t>(lbm::kQ);
+    const std::size_t periodic_plane_bytes =
+        2 * sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.ny * cfg.nz);
+
+    // Host-side persistent buffers: node map, four macroscopic output fields,
+    // and the VMM control structure (base + current population pointers).
+    report.host_bytes =
+        node_type_bytes +
+        4 * scalar_field_bytes +
+        2 * pointer_bytes;
+
+    // GPU-side persistent buffers: the DF field, four macro fields, the node
+    // type field, and the device copy of the per-population pointer table.
+    report.gpu_bytes =
+        q_field_bytes +
+        4 * scalar_field_bytes +
+        node_type_bytes +
+        pointer_bytes +
+        periodic_plane_bytes;
+#else
     const std::size_t shift_bytes = sizeof(int) * static_cast<std::size_t>(lbm::kQ);
 
     // Host-side persistent buffers: node map, four macroscopic output fields,
@@ -450,6 +490,7 @@ MemoryReport build_memory_report(int cell_count) {
         4 * scalar_field_bytes +
         node_type_bytes +
         3 * shift_bytes;
+#endif
 
     report.total_bytes = report.host_bytes + report.gpu_bytes;
     report.host_bytes_per_cell = static_cast<double>(report.host_bytes) / static_cast<double>(cell_count);
@@ -457,6 +498,206 @@ MemoryReport build_memory_report(int cell_count) {
     report.total_bytes_per_cell = static_cast<double>(report.total_bytes) / static_cast<double>(cell_count);
     return report;
 }
+
+#if defined(LBM_USE_VMM_STREAMING)
+std::string cu_result_text(CUresult result) {
+    const char* error_name = nullptr;
+    const char* error_string = nullptr;
+    cuGetErrorName(result, &error_name);
+    cuGetErrorString(result, &error_string);
+
+    std::ostringstream os;
+    os << (error_name != nullptr ? error_name : "CUDA_DRIVER_ERROR");
+    if (error_string != nullptr) {
+        os << ": " << error_string;
+    }
+    return os.str();
+}
+
+void cu_check(CUresult result, const char* what) {
+    if (result != CUDA_SUCCESS) {
+        throw std::runtime_error(std::string(what) + ": " + cu_result_text(result));
+    }
+}
+
+void initialize_distribution_storage(const SimulationConfig& cfg, DistributionStorage* storage) {
+    cu_check(cuInit(0), "initialize CUDA driver API");
+
+    int device_ordinal = 0;
+    lbm::cuda_check(cudaGetDevice(&device_ordinal), "query active CUDA device");
+
+    CUdevice device = 0;
+    cu_check(cuDeviceGet(&device, device_ordinal), "get CUDA device handle");
+
+    int vmm_supported = 0;
+    cu_check(
+        cuDeviceGetAttribute(&vmm_supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device),
+        "query VMM support");
+    if (vmm_supported == 0) {
+        throw std::runtime_error("LBM_USE_VMM_STREAMING is enabled, but the active GPU does not support CUDA virtual memory management.");
+    }
+
+    CUmemAllocationProp allocation{};
+    allocation.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    allocation.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    allocation.location.id = device_ordinal;
+
+    std::size_t granularity = 0;
+    cu_check(
+        cuMemGetAllocationGranularity(&granularity, &allocation, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+        "query CUDA VMM allocation granularity");
+
+    const std::size_t population_bytes = sizeof(Real) * static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz);
+    if (population_bytes % granularity != 0) {
+        std::ostringstream os;
+        os << "LBM_USE_VMM_STREAMING requires the per-population byte size (" << population_bytes
+           << ") to be a multiple of the CUDA VMM granularity (" << granularity << ").";
+        throw std::runtime_error(os.str());
+    }
+
+    storage->population_bytes = population_bytes;
+    storage->population_cells = population_bytes / sizeof(Real);
+    storage->granularity_bytes = granularity;
+
+    const std::size_t reservation_bytes = 2 * static_cast<std::size_t>(lbm::kQ) * population_bytes;
+    cu_check(cuMemAddressReserve(&storage->reservation, reservation_bytes, 0, 0, 0), "reserve VMM address space");
+
+    for (int q = 0; q < lbm::kQ; ++q) {
+        cu_check(cuMemCreate(&storage->handles[q], population_bytes, &allocation, 0), "create VMM population allocation");
+
+        const CUdeviceptr base_ptr = storage->reservation + static_cast<CUdeviceptr>(2 * static_cast<std::size_t>(q) * population_bytes);
+        cu_check(cuMemMap(base_ptr, population_bytes, 0, storage->handles[q], 0), "map primary VMM population view");
+        cu_check(cuMemMap(base_ptr + population_bytes, population_bytes, 0, storage->handles[q], 0), "map aliased VMM population view");
+
+        storage->base[q] = reinterpret_cast<Real*>(base_ptr);
+        storage->current[q] = storage->base[q];
+    }
+
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = device_ordinal;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    cu_check(cuMemSetAccess(storage->reservation, reservation_bytes, &access, 1), "set VMM population access");
+
+    lbm::cuda_check(
+        cudaMalloc(reinterpret_cast<void**>(&storage->d_population), sizeof(Real*) * static_cast<std::size_t>(lbm::kQ)),
+        "allocate VMM population pointer table");
+    lbm::cuda_check(
+        cudaMemcpy(
+            storage->d_population,
+            storage->current.data(),
+            sizeof(Real*) * static_cast<std::size_t>(lbm::kQ),
+            cudaMemcpyHostToDevice),
+        "copy initial VMM population pointers");
+    const std::size_t periodic_plane_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.ny * cfg.nz);
+    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_xmin_plane), periodic_plane_bytes), "allocate periodic xmin plane buffer");
+    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_xmax_plane), periodic_plane_bytes), "allocate periodic xmax plane buffer");
+
+    storage->view.population = storage->d_population;
+}
+
+void advance_streaming_state(const SimulationConfig& cfg, DistributionStorage* storage) {
+    const std::ptrdiff_t logical_cells = static_cast<std::ptrdiff_t>(storage->population_cells);
+
+    // Streaming is a pure control-structure update: each population pointer is
+    // rotated by its invariant linear D3Q27 offset inside the doubled virtual
+    // address range.
+    for (int q = 0; q < lbm::kQ; ++q) {
+        const std::ptrdiff_t shift = -static_cast<std::ptrdiff_t>(lbm::streaming_linear_offset(q, cfg));
+        storage->current[q] += shift;
+        if (storage->current[q] < storage->base[q]) {
+            storage->current[q] += logical_cells;
+        } else if (storage->current[q] + logical_cells > storage->base[q] + 2 * logical_cells) {
+            storage->current[q] -= logical_cells;
+        }
+    }
+
+    lbm::cuda_check(
+        cudaMemcpy(
+            storage->d_population,
+            storage->current.data(),
+            sizeof(Real*) * static_cast<std::size_t>(lbm::kQ),
+            cudaMemcpyHostToDevice),
+        "update VMM population pointers");
+}
+
+void destroy_distribution_storage(DistributionStorage* storage) {
+    if (storage->d_xmin_plane != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_xmin_plane), "free periodic xmin plane buffer");
+    }
+    if (storage->d_xmax_plane != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_xmax_plane), "free periodic xmax plane buffer");
+    }
+    if (storage->d_population != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_population), "free VMM population pointer table");
+    }
+
+    if (storage->reservation != 0 && storage->population_bytes != 0) {
+        for (int q = 0; q < lbm::kQ; ++q) {
+            const CUdeviceptr base_ptr = storage->reservation + static_cast<CUdeviceptr>(2 * static_cast<std::size_t>(q) * storage->population_bytes);
+            cu_check(cuMemUnmap(base_ptr, storage->population_bytes), "unmap primary VMM population view");
+            cu_check(cuMemUnmap(base_ptr + storage->population_bytes, storage->population_bytes), "unmap aliased VMM population view");
+        }
+    }
+
+    for (int q = 0; q < lbm::kQ; ++q) {
+        if (storage->handles[q] != 0) {
+            cu_check(cuMemRelease(storage->handles[q]), "release VMM population allocation");
+        }
+    }
+
+    if (storage->reservation != 0 && storage->population_bytes != 0) {
+        const std::size_t reservation_bytes = 2 * static_cast<std::size_t>(lbm::kQ) * storage->population_bytes;
+        cu_check(cuMemAddressFree(storage->reservation, reservation_bytes), "free VMM address reservation");
+    }
+}
+#else
+void initialize_distribution_storage(const SimulationConfig& cfg, DistributionStorage* storage) {
+    const std::size_t q_field_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz);
+    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_field), q_field_bytes), "allocate DF field");
+    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_sx), sizeof(int) * lbm::kQ), "allocate x shifts");
+    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_sy), sizeof(int) * lbm::kQ), "allocate y shifts");
+    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_sz), sizeof(int) * lbm::kQ), "allocate z shifts");
+    lbm::cuda_check(cudaMemcpy(storage->d_sx, storage->shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial x shifts");
+    lbm::cuda_check(cudaMemcpy(storage->d_sy, storage->shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial y shifts");
+    lbm::cuda_check(cudaMemcpy(storage->d_sz, storage->shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial z shifts");
+
+    storage->view.population = storage->d_field;
+    storage->view.sx = storage->d_sx;
+    storage->view.sy = storage->d_sy;
+    storage->view.sz = storage->d_sz;
+}
+
+void advance_streaming_state(const SimulationConfig& cfg, DistributionStorage* storage) {
+    // After collide-and-stream has written into the next logical shift layout,
+    // the host advances the cumulative offsets so all subsequent accesses use
+    // that new streamed state.
+    for (int q = 0; q < lbm::kQ; ++q) {
+        storage->shift_x[q] = lbm::advance_shift_index(storage->shift_x[q], lbm::kCx[q], cfg.nx);
+        storage->shift_y[q] = lbm::advance_shift_index(storage->shift_y[q], lbm::kCy[q], cfg.ny);
+        storage->shift_z[q] = lbm::advance_shift_index(storage->shift_z[q], lbm::kCz[q], cfg.nz);
+    }
+
+    lbm::cuda_check(cudaMemcpy(storage->d_sx, storage->shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update x shifts");
+    lbm::cuda_check(cudaMemcpy(storage->d_sy, storage->shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update y shifts");
+    lbm::cuda_check(cudaMemcpy(storage->d_sz, storage->shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update z shifts");
+}
+
+void destroy_distribution_storage(DistributionStorage* storage) {
+    if (storage->d_field != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_field), "free DF field");
+    }
+    if (storage->d_sx != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_sx), "free x shifts");
+    }
+    if (storage->d_sy != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_sy), "free y shifts");
+    }
+    if (storage->d_sz != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_sz), "free z shifts");
+    }
+}
+#endif
 
 void print_memory_report(const MemoryReport& report) {
     std::cout << "Memory demand per simulation"
@@ -504,19 +745,16 @@ int main(int argc, char** argv) {
 
         const int cell_count = cfg.nx * cfg.ny * cfg.nz;
         const std::size_t field_bytes = sizeof(Real) * static_cast<std::size_t>(cell_count);
-        const MemoryReport memory_report = build_memory_report(cell_count);
+        const MemoryReport memory_report = build_memory_report(cfg, cell_count);
 
-        Real* d_f = nullptr;
         Real* d_rho = nullptr;
         Real* d_ux = nullptr;
         Real* d_uy = nullptr;
         Real* d_uz = nullptr;
         std::uint8_t* d_node_type = nullptr;
-        int* d_sx = nullptr;
-        int* d_sy = nullptr;
-        int* d_sz = nullptr;
+        DistributionStorage distribution_storage{};
 
-        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_f), sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * cell_count), "allocate DF field");
+        initialize_distribution_storage(cfg, &distribution_storage);
         lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_rho), field_bytes), "allocate rho field");
         lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ux), field_bytes), "allocate ux field");
         lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_uy), field_bytes), "allocate uy field");
@@ -524,28 +762,18 @@ int main(int argc, char** argv) {
         lbm::cuda_check(
             cudaMalloc(reinterpret_cast<void**>(&d_node_type), sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count)),
             "allocate node type field");
-        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sx), sizeof(int) * lbm::kQ), "allocate x shifts");
-        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sy), sizeof(int) * lbm::kQ), "allocate y shifts");
-        lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sz), sizeof(int) * lbm::kQ), "allocate z shifts");
-
-        std::array<int, lbm::kQ> shift_x{};
-        std::array<int, lbm::kQ> shift_y{};
-        std::array<int, lbm::kQ> shift_z{};
         std::vector<std::uint8_t> host_node_type(cell_count, 0);
         std::vector<Real> host_rho(cell_count, Real(0.0));
         std::vector<Real> host_ux(cell_count, Real(0.0));
         std::vector<Real> host_uy(cell_count, Real(0.0));
         std::vector<Real> host_uz(cell_count, Real(0.0));
-        lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial x shifts");
-        lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial y shifts");
-        lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial z shifts");
 
         lbm::build_default_node_type_map(&host_node_type, cfg);
         apply_user_node_type_primitives(&host_node_type, cfg);
         lbm::cuda_check(
             cudaMemcpy(d_node_type, host_node_type.data(), sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count), cudaMemcpyHostToDevice),
             "copy node type field");
-        lbm::launch_initialize_equilibrium(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+        lbm::launch_initialize_equilibrium(distribution_storage.view, d_node_type, cfg);
         lbm::cuda_check(cudaDeviceSynchronize(), "initialize solver state");
         if (runtime.write_node_map) {
             lbm::write_node_map_vti(runtime.output_dir + "/map.vti", cfg, host_node_type);
@@ -561,7 +789,7 @@ int main(int argc, char** argv) {
         MlupsStats mlups_stats{};
 
         auto recover_to_host = [&](int step, bool write_output, Real initial_mass, Real* previous_bulk_velocity) {
-            lbm::launch_recover_macros(d_f, d_node_type, cfg, d_sx, d_sy, d_sz, d_rho, d_ux, d_uy, d_uz);
+            lbm::launch_recover_macros(distribution_storage.view, d_node_type, cfg, d_rho, d_ux, d_uy, d_uz);
             lbm::cuda_check(cudaDeviceSynchronize(), "recover macroscopic fields");
             lbm::cuda_check(cudaMemcpy(host_rho.data(), d_rho, field_bytes, cudaMemcpyDeviceToHost), "copy rho to host");
             lbm::cuda_check(cudaMemcpy(host_ux.data(), d_ux, field_bytes, cudaMemcpyDeviceToHost), "copy ux to host");
@@ -596,11 +824,15 @@ int main(int argc, char** argv) {
                   << " mode=" << mode_name(cfg.mode)
                   << " outlet=" << outlet_name(cfg.outlet_mode)
                   << " inlet-profile=" << profile_name(cfg.inlet_profile)
+                  << " streaming=" << streaming_backend_name()
                   << " cross-sections=" << (runtime.write_cross_sections ? "on" : "off")
                   << " node-map=" << (runtime.write_node_map ? "on" : "off")
                   << " do-not-write-full-volume=" << (runtime.do_not_write_full_volume ? "on" : "off")
                   << '\n';
         print_memory_report(memory_report);
+#if defined(LBM_USE_VMM_STREAMING)
+        std::cout << "CUDA VMM population granularity=" << distribution_storage.granularity_bytes << " B\n";
+#endif
 
         Real previous_bulk_velocity = Real(0.0);
         const Diagnostics initial_diagnostics = recover_to_host(0, true, Real(0.0), &previous_bulk_velocity);
@@ -609,18 +841,24 @@ int main(int argc, char** argv) {
         Diagnostics latest_diagnostics = initial_diagnostics;
 
         for (int step = 1; step <= cfg.nsteps; ++step) {
-            lbm::launch_collide_and_stream(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
-            update_shift_vectors(cfg, &shift_x, &shift_y, &shift_z);
-            lbm::cuda_check(cudaMemcpy(d_sx, shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update x shifts");
-            lbm::cuda_check(cudaMemcpy(d_sy, shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update y shifts");
-            lbm::cuda_check(cudaMemcpy(d_sz, shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update z shifts");
+            lbm::launch_collide_and_stream(distribution_storage.view, d_node_type, cfg);
+            advance_streaming_state(cfg, &distribution_storage);
             // Boundary reconstruction always runs after the streamed field exists
             // in logical form at the current shift state.
-            lbm::launch_apply_wall_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+#if defined(LBM_USE_VMM_STREAMING)
+            if (cfg.mode == StreamwiseMode::PeriodicBodyForce) {
+                lbm::launch_apply_periodic_x_boundaries(
+                    distribution_storage.view,
+                    cfg,
+                    distribution_storage.d_xmin_plane,
+                    distribution_storage.d_xmax_plane);
+            }
+#endif
+            lbm::launch_apply_wall_boundaries(distribution_storage.view, d_node_type, cfg);
             if (cfg.mode == StreamwiseMode::Pressure) {
-                lbm::launch_apply_pressure_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+                lbm::launch_apply_pressure_boundaries(distribution_storage.view, d_node_type, cfg);
             } else if (cfg.mode == StreamwiseMode::Velocity) {
-                lbm::launch_apply_velocity_boundaries(d_f, d_node_type, cfg, d_sx, d_sy, d_sz);
+                lbm::launch_apply_velocity_boundaries(distribution_storage.view, d_node_type, cfg);
             }
 
             const bool write_output = (cfg.output_every > 0) && (step % cfg.output_every == 0 || step == cfg.nsteps);
@@ -636,15 +874,12 @@ int main(int argc, char** argv) {
                   << " avg=" << latest_diagnostics.mlups_avg
                   << " max=" << latest_diagnostics.mlups_max << '\n';
 
-        lbm::cuda_check(cudaFree(d_f), "free DF field");
+        destroy_distribution_storage(&distribution_storage);
         lbm::cuda_check(cudaFree(d_rho), "free rho field");
         lbm::cuda_check(cudaFree(d_ux), "free ux field");
         lbm::cuda_check(cudaFree(d_uy), "free uy field");
         lbm::cuda_check(cudaFree(d_uz), "free uz field");
         lbm::cuda_check(cudaFree(d_node_type), "free node type field");
-        lbm::cuda_check(cudaFree(d_sx), "free x shifts");
-        lbm::cuda_check(cudaFree(d_sy), "free y shifts");
-        lbm::cuda_check(cudaFree(d_sz), "free z shifts");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
