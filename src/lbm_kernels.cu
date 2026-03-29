@@ -50,50 +50,15 @@ __device__ __constant__ Real g_w[kQ];
 #define LBM_STORE_F_ALIGNED(q) view.p##q[(cell)] = f_##q
 #define LBM_STORE_F_OFFSET(q) view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)] = f_##q
 #if defined(LBM_BENCH_COMPUTE_ONLY)
-#define LBM_BENCH_ACCUM_DECL Real bench_checksum = Real(0.0)
-#define LBM_BENCH_ACCUMULATE(value) bench_checksum += (value) * Real(1.0e-30)
-#define LBM_BENCH_FLUSH_ALIGNED() do { if (bench_checksum == Real(-1234567.0)) view.p0[(cell)] = bench_checksum; } while (0)
-#define LBM_BENCH_FLUSH_OFFSET() do { if (bench_checksum == Real(-1234567.0)) view.p0[LBM_VMM_OFFSET_CELL((cell), offset[0], logical_cells)] = bench_checksum; } while (0)
+#define LBM_BENCH_ACCUM_DECL Real bench_checksum = 0.0
+#define LBM_BENCH_ACCUMULATE(value) bench_checksum += (value) * 1.0e-30
+#define LBM_BENCH_FLUSH_ALIGNED() do { if (bench_checksum == -1234567.0) view.p0[(cell)] = bench_checksum; } while (0)
+#define LBM_BENCH_FLUSH_OFFSET() do { if (bench_checksum == -1234567.0) view.p0[LBM_VMM_OFFSET_CELL((cell), offset[0], logical_cells)] = bench_checksum; } while (0)
 #else
 #define LBM_BENCH_ACCUM_DECL
 #define LBM_BENCH_ACCUMULATE(value) do { } while (0)
 #define LBM_BENCH_FLUSH_ALIGNED() do { } while (0)
 #define LBM_BENCH_FLUSH_OFFSET() do { } while (0)
-#endif
-
-#if defined(LBM_BENCH_STORE_INPUT)
-#define LBM_COLLIDE_UPDATE(q) do { } while (0)
-#elif defined(LBM_BENCH_COMPUTE_ONLY)
-// optimized.cu-style hot path: keep each population in a scalar register, update
-// that scalar in place, then emit the stores in one final block.
-#define LBM_COLLIDE_UPDATE(q) \
-    { \
-        const Real cu = Real(g_cx[(q)]) * ux + Real(g_cy[(q)]) * uy + Real(g_cz[(q)]) * uz; \
-        const Real feq = g_w[(q)] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu); \
-        const Real c_minus_u_x = Real(g_cx[(q)]) - ux; \
-        const Real c_minus_u_y = Real(g_cy[(q)]) - uy; \
-        const Real c_minus_u_z = Real(g_cz[(q)]) - uz; \
-        const Real projection_x = c_minus_u_x * kInvCs2 + Real(g_cx[(q)]) * cu * kInvCs4; \
-        const Real projection_y = c_minus_u_y * kInvCs2 + Real(g_cy[(q)]) * cu * kInvCs4; \
-        const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[(q)]) * cu * kInvCs4; \
-        const Real force_term = g_w[(q)] * (Real(1.0) - Real(0.5) * cfg.omega) * (projection_x * fx + projection_y * fy + projection_z * fz); \
-        const Real post_collision = f_##q - cfg.omega * (f_##q - feq) + force_term; \
-        LBM_BENCH_ACCUMULATE(post_collision); \
-    }
-#else
-#define LBM_COLLIDE_UPDATE(q) \
-    { \
-        const Real cu = Real(g_cx[(q)]) * ux + Real(g_cy[(q)]) * uy + Real(g_cz[(q)]) * uz; \
-        const Real feq = g_w[(q)] * rho * (Real(1.0) + kInvCs2 * cu + Real(0.5) * kInvCs4 * cu * cu - Real(0.5) * kInvCs2 * uu); \
-        const Real c_minus_u_x = Real(g_cx[(q)]) - ux; \
-        const Real c_minus_u_y = Real(g_cy[(q)]) - uy; \
-        const Real c_minus_u_z = Real(g_cz[(q)]) - uz; \
-        const Real projection_x = c_minus_u_x * kInvCs2 + Real(g_cx[(q)]) * cu * kInvCs4; \
-        const Real projection_y = c_minus_u_y * kInvCs2 + Real(g_cy[(q)]) * cu * kInvCs4; \
-        const Real projection_z = c_minus_u_z * kInvCs2 + Real(g_cz[(q)]) * cu * kInvCs4; \
-        const Real force_term = g_w[(q)] * (Real(1.0) - Real(0.5) * cfg.omega) * (projection_x * fx + projection_y * fy + projection_z * fz); \
-        f_##q = f_##q - cfg.omega * (f_##q - feq) + force_term; \
-    }
 #endif
 
 namespace {
@@ -272,6 +237,8 @@ __global__ __launch_bounds__(kLaunchBounds) void initialize_equilibrium_kernel(
     }
 }
 
+
+// FIXME add force for model A
 template <bool UseOffset>
 __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     StreamingView view,
@@ -352,57 +319,59 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
 #if defined(LBM_BENCH_STORE_INPUT)
         // Memory-path benchmark: preserve the 27 DF writes but skip collision math.
 #else
-        const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
-        const Real fy = Real(0.0);
-        const Real fz = Real(0.0);
+        const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : 0.0;
+        const Real fy = 0.0;
+        const Real fz = 0.0;
         Real rho =
             f_0 + f_1 + f_2 + f_3 + f_4 + f_5 + f_6 + f_7 + f_8 +
             f_9 + f_10 + f_11 + f_12 + f_13 + f_14 + f_15 + f_16 + f_17 +
             f_18 + f_19 + f_20 + f_21 + f_22 + f_23 + f_24 + f_25 + f_26;
-        rho = rho > Real(1.0e-20) ? rho : Real(1.0e-20);
-        const Real mx =
+        rho = rho > 1.0e-20 ? rho : 1.0e-20;
+        const Real invrho = 1.0 / rho;
+        Real ux =
             f_1 - f_2 + f_7 - f_8 + f_9 - f_10 + f_11 - f_12 + f_13 - f_14 +
             f_19 - f_20 + f_21 - f_22 + f_23 - f_24 + f_25 - f_26;
-        const Real my =
+        Real uy =
             f_3 - f_4 + f_7 - f_8 - f_9 + f_10 + f_15 - f_16 + f_17 - f_18 +
             f_19 - f_20 + f_21 - f_22 - f_23 + f_24 - f_25 + f_26;
-        const Real mz =
+        Real uz =
             f_5 - f_6 + f_11 - f_12 - f_13 + f_14 + f_15 - f_16 - f_17 + f_18 +
             f_19 - f_20 - f_21 + f_22 + f_23 - f_24 - f_25 + f_26;
-        const Real ux = (mx + Real(0.5) * fx) / rho;
-        const Real uy = (my + Real(0.5) * fy) / rho;
-        const Real uz = (mz + Real(0.5) * fz) / rho;
+        ux = (ux + 0.5 * fx) * invrho;
+        uy = (uy + 0.5 * fy) * invrho;
+        uz = (uz + 0.5 * fz) * invrho;
         const Real uu = ux * ux + uy * uy + uz * uz;
         LBM_BENCH_ACCUM_DECL;
+        const Real omega = cfg.omega;
+        
+		f_20 += omega*(_feq_mmm(rho,ux,uy,uz,uu) - f_20);
+		f_8 += omega*(_feq_mmz(rho,ux,uy,uz,uu) - f_8);
+		f_22 += omega*(_feq_mmp(rho,ux,uy,uz,uu) - f_22);
+		f_12 += omega*(_feq_mzm(rho,ux,uy,uz,uu) - f_12);
+		f_2 += omega*(_feq_mzz(rho,ux,uy,uz,uu) - f_2);
+		f_14 += omega*(_feq_mzp(rho,ux,uy,uz,uu) - f_14);
+		f_24 += omega*(_feq_mpm(rho,ux,uy,uz,uu) - f_24);
+		f_10 += omega*(_feq_mpz(rho,ux,uy,uz,uu) - f_10);
+		f_26 += omega*(_feq_mpp(rho,ux,uy,uz,uu) - f_26);
+		f_16 += omega*(_feq_zmm(rho,ux,uy,uz,uu) - f_16);
+		f_4 += omega*(_feq_zmz(rho,ux,uy,uz,uu) - f_4);
+		f_18 += omega*(_feq_zmp(rho,ux,uy,uz,uu) - f_18);
+		f_6 += omega*(_feq_zzm(rho,ux,uy,uz,uu) - f_6);
+		f_0 += omega*(_feq_zzz(rho,ux,uy,uz,uu) - f_0);
+		f_5 += omega*(_feq_zzp(rho,ux,uy,uz,uu) - f_5);
+		f_17 += omega*(_feq_zpm(rho,ux,uy,uz,uu) - f_17);
+		f_3 += omega*(_feq_zpz(rho,ux,uy,uz,uu) - f_3);
+		f_15 += omega*(_feq_zpp(rho,ux,uy,uz,uu) - f_15);
+		f_25 += omega*(_feq_pmm(rho,ux,uy,uz,uu) - f_25);
+		f_9 += omega*(_feq_pmz(rho,ux,uy,uz,uu) - f_9);
+		f_23 += omega*(_feq_pmp(rho,ux,uy,uz,uu) - f_23);
+		f_13 += omega*(_feq_pzm(rho,ux,uy,uz,uu) - f_13);
+		f_1 += omega*(_feq_pzz(rho,ux,uy,uz,uu) - f_1);
+		f_11 += omega*(_feq_pzp(rho,ux,uy,uz,uu) - f_11);
+		f_21 += omega*(_feq_ppm(rho,ux,uy,uz,uu) - f_21);
+		f_7 += omega*(_feq_ppz(rho,ux,uy,uz,uu) - f_7);
+		f_19 += omega*(_feq_ppp(rho,ux,uy,uz,uu) - f_19);
 #endif
-
-        LBM_COLLIDE_UPDATE(0);
-        LBM_COLLIDE_UPDATE(1);
-        LBM_COLLIDE_UPDATE(2);
-        LBM_COLLIDE_UPDATE(3);
-        LBM_COLLIDE_UPDATE(4);
-        LBM_COLLIDE_UPDATE(5);
-        LBM_COLLIDE_UPDATE(6);
-        LBM_COLLIDE_UPDATE(7);
-        LBM_COLLIDE_UPDATE(8);
-        LBM_COLLIDE_UPDATE(9);
-        LBM_COLLIDE_UPDATE(10);
-        LBM_COLLIDE_UPDATE(11);
-        LBM_COLLIDE_UPDATE(12);
-        LBM_COLLIDE_UPDATE(13);
-        LBM_COLLIDE_UPDATE(14);
-        LBM_COLLIDE_UPDATE(15);
-        LBM_COLLIDE_UPDATE(16);
-        LBM_COLLIDE_UPDATE(17);
-        LBM_COLLIDE_UPDATE(18);
-        LBM_COLLIDE_UPDATE(19);
-        LBM_COLLIDE_UPDATE(20);
-        LBM_COLLIDE_UPDATE(21);
-        LBM_COLLIDE_UPDATE(22);
-        LBM_COLLIDE_UPDATE(23);
-        LBM_COLLIDE_UPDATE(24);
-        LBM_COLLIDE_UPDATE(25);
-        LBM_COLLIDE_UPDATE(26);
 #if !defined(LBM_BENCH_COMPUTE_ONLY)
         LBM_STORE_F_OFFSET(0);
         LBM_STORE_F_OFFSET(1);
@@ -505,7 +474,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
             f_0 + f_1 + f_2 + f_3 + f_4 + f_5 + f_6 + f_7 + f_8 +
             f_9 + f_10 + f_11 + f_12 + f_13 + f_14 + f_15 + f_16 + f_17 +
             f_18 + f_19 + f_20 + f_21 + f_22 + f_23 + f_24 + f_25 + f_26;
-        // rho = rho > Real(1.0e-20) ? rho : Real(1.0e-20);
+        rho = rho > 1.0e-20 ? rho : 1.0e-20;
         const Real invrho = 1.0 / rho;
         Real ux =
             f_1 - f_2 + f_7 - f_8 + f_9 - f_10 + f_11 - f_12 + f_13 - f_14 +
@@ -521,11 +490,6 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         uz = (uz + 0.5 * fz) * invrho;
         const Real uu = ux * ux + uy * uy + uz * uz;
         LBM_BENCH_ACCUM_DECL;
-#endif
-// 0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1
-// 0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1
-// 0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1, 1,-1,-1, 1, 1,-1,-1, 1
-// 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26
         const Real omega = cfg.omega;
 		f_20 += omega*(_feq_mmm(rho,ux,uy,uz,uu) - f_20);
 		f_8 += omega*(_feq_mmz(rho,ux,uy,uz,uu) - f_8);
@@ -554,6 +518,7 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
 		f_21 += omega*(_feq_ppm(rho,ux,uy,uz,uu) - f_21);
 		f_7 += omega*(_feq_ppz(rho,ux,uy,uz,uu) - f_7);
 		f_19 += omega*(_feq_ppp(rho,ux,uy,uz,uu) - f_19);
+#endif
 
 #if !defined(LBM_BENCH_COMPUTE_ONLY)
         LBM_STORE_F_ALIGNED(0);
@@ -589,317 +554,6 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
     }
 }
 
-
-template <bool UseOffset>
-__global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel_old(
-    StreamingView view,
-    const std::uint8_t* LBM_RESTRICT node_type,
-    SimulationConfig cfg) {
-    int tid = 0;
-    int x = 0;
-    int y = 0;
-    int z = 0;
-    if (!volume_thread_coordinates(cfg, &tid, &x, &y, &z)) {
-        return;
-    }
-    const int cell = tid;
-
-    if constexpr (UseOffset) {
-        const int* LBM_RESTRICT offset = view.offset;
-        const int logical_cells = view.logical_cells;
-        LBM_LOAD_F_OFFSET(0);
-        LBM_LOAD_F_OFFSET(1);
-        LBM_LOAD_F_OFFSET(2);
-        LBM_LOAD_F_OFFSET(3);
-        LBM_LOAD_F_OFFSET(4);
-        LBM_LOAD_F_OFFSET(5);
-        LBM_LOAD_F_OFFSET(6);
-        LBM_LOAD_F_OFFSET(7);
-        LBM_LOAD_F_OFFSET(8);
-        LBM_LOAD_F_OFFSET(9);
-        LBM_LOAD_F_OFFSET(10);
-        LBM_LOAD_F_OFFSET(11);
-        LBM_LOAD_F_OFFSET(12);
-        LBM_LOAD_F_OFFSET(13);
-        LBM_LOAD_F_OFFSET(14);
-        LBM_LOAD_F_OFFSET(15);
-        LBM_LOAD_F_OFFSET(16);
-        LBM_LOAD_F_OFFSET(17);
-        LBM_LOAD_F_OFFSET(18);
-        LBM_LOAD_F_OFFSET(19);
-        LBM_LOAD_F_OFFSET(20);
-        LBM_LOAD_F_OFFSET(21);
-        LBM_LOAD_F_OFFSET(22);
-        LBM_LOAD_F_OFFSET(23);
-        LBM_LOAD_F_OFFSET(24);
-        LBM_LOAD_F_OFFSET(25);
-        LBM_LOAD_F_OFFSET(26);
-        
-        const std::uint8_t type = node_type[tid];
-        if (type != kFluid) {
-            LBM_STORE_F_OFFSET(0);
-            LBM_STORE_F_OFFSET(1);
-            LBM_STORE_F_OFFSET(2);
-            LBM_STORE_F_OFFSET(3);
-            LBM_STORE_F_OFFSET(4);
-            LBM_STORE_F_OFFSET(5);
-            LBM_STORE_F_OFFSET(6);
-            LBM_STORE_F_OFFSET(7);
-            LBM_STORE_F_OFFSET(8);
-            LBM_STORE_F_OFFSET(9);
-            LBM_STORE_F_OFFSET(10);
-            LBM_STORE_F_OFFSET(11);
-            LBM_STORE_F_OFFSET(12);
-            LBM_STORE_F_OFFSET(13);
-            LBM_STORE_F_OFFSET(14);
-            LBM_STORE_F_OFFSET(15);
-            LBM_STORE_F_OFFSET(16);
-            LBM_STORE_F_OFFSET(17);
-            LBM_STORE_F_OFFSET(18);
-            LBM_STORE_F_OFFSET(19);
-            LBM_STORE_F_OFFSET(20);
-            LBM_STORE_F_OFFSET(21);
-            LBM_STORE_F_OFFSET(22);
-            LBM_STORE_F_OFFSET(23);
-            LBM_STORE_F_OFFSET(24);
-            LBM_STORE_F_OFFSET(25);
-            LBM_STORE_F_OFFSET(26);
-            return;
-        }
-
-#if defined(LBM_BENCH_STORE_INPUT)
-        // Memory-path benchmark: preserve the 27 DF writes but skip collision math.
-#else
-        const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
-        const Real fy = Real(0.0);
-        const Real fz = Real(0.0);
-        Real rho =
-            f_0 + f_1 + f_2 + f_3 + f_4 + f_5 + f_6 + f_7 + f_8 +
-            f_9 + f_10 + f_11 + f_12 + f_13 + f_14 + f_15 + f_16 + f_17 +
-            f_18 + f_19 + f_20 + f_21 + f_22 + f_23 + f_24 + f_25 + f_26;
-        rho = rho > Real(1.0e-20) ? rho : Real(1.0e-20);
-        const Real mx =
-            f_1 - f_2 + f_7 - f_8 + f_9 - f_10 + f_11 - f_12 + f_13 - f_14 +
-            f_19 - f_20 + f_21 - f_22 + f_23 - f_24 + f_25 - f_26;
-        const Real my =
-            f_3 - f_4 + f_7 - f_8 - f_9 + f_10 + f_15 - f_16 + f_17 - f_18 +
-            f_19 - f_20 + f_21 - f_22 - f_23 + f_24 - f_25 + f_26;
-        const Real mz =
-            f_5 - f_6 + f_11 - f_12 - f_13 + f_14 + f_15 - f_16 - f_17 + f_18 +
-            f_19 - f_20 - f_21 + f_22 + f_23 - f_24 - f_25 + f_26;
-        const Real ux = (mx + Real(0.5) * fx) / rho;
-        const Real uy = (my + Real(0.5) * fy) / rho;
-        const Real uz = (mz + Real(0.5) * fz) / rho;
-        const Real uu = ux * ux + uy * uy + uz * uz;
-        LBM_BENCH_ACCUM_DECL;
-#endif
-
-        LBM_COLLIDE_UPDATE(0);
-        LBM_COLLIDE_UPDATE(1);
-        LBM_COLLIDE_UPDATE(2);
-        LBM_COLLIDE_UPDATE(3);
-        LBM_COLLIDE_UPDATE(4);
-        LBM_COLLIDE_UPDATE(5);
-        LBM_COLLIDE_UPDATE(6);
-        LBM_COLLIDE_UPDATE(7);
-        LBM_COLLIDE_UPDATE(8);
-        LBM_COLLIDE_UPDATE(9);
-        LBM_COLLIDE_UPDATE(10);
-        LBM_COLLIDE_UPDATE(11);
-        LBM_COLLIDE_UPDATE(12);
-        LBM_COLLIDE_UPDATE(13);
-        LBM_COLLIDE_UPDATE(14);
-        LBM_COLLIDE_UPDATE(15);
-        LBM_COLLIDE_UPDATE(16);
-        LBM_COLLIDE_UPDATE(17);
-        LBM_COLLIDE_UPDATE(18);
-        LBM_COLLIDE_UPDATE(19);
-        LBM_COLLIDE_UPDATE(20);
-        LBM_COLLIDE_UPDATE(21);
-        LBM_COLLIDE_UPDATE(22);
-        LBM_COLLIDE_UPDATE(23);
-        LBM_COLLIDE_UPDATE(24);
-        LBM_COLLIDE_UPDATE(25);
-        LBM_COLLIDE_UPDATE(26);
-#if !defined(LBM_BENCH_COMPUTE_ONLY)
-        LBM_STORE_F_OFFSET(0);
-        LBM_STORE_F_OFFSET(1);
-        LBM_STORE_F_OFFSET(2);
-        LBM_STORE_F_OFFSET(3);
-        LBM_STORE_F_OFFSET(4);
-        LBM_STORE_F_OFFSET(5);
-        LBM_STORE_F_OFFSET(6);
-        LBM_STORE_F_OFFSET(7);
-        LBM_STORE_F_OFFSET(8);
-        LBM_STORE_F_OFFSET(9);
-        LBM_STORE_F_OFFSET(10);
-        LBM_STORE_F_OFFSET(11);
-        LBM_STORE_F_OFFSET(12);
-        LBM_STORE_F_OFFSET(13);
-        LBM_STORE_F_OFFSET(14);
-        LBM_STORE_F_OFFSET(15);
-        LBM_STORE_F_OFFSET(16);
-        LBM_STORE_F_OFFSET(17);
-        LBM_STORE_F_OFFSET(18);
-        LBM_STORE_F_OFFSET(19);
-        LBM_STORE_F_OFFSET(20);
-        LBM_STORE_F_OFFSET(21);
-        LBM_STORE_F_OFFSET(22);
-        LBM_STORE_F_OFFSET(23);
-        LBM_STORE_F_OFFSET(24);
-        LBM_STORE_F_OFFSET(25);
-        LBM_STORE_F_OFFSET(26);
-#else
-        LBM_BENCH_FLUSH_OFFSET();
-#endif
-    } else {
-        LBM_LOAD_F_ALIGNED(0);
-        LBM_LOAD_F_ALIGNED(1);
-        LBM_LOAD_F_ALIGNED(2);
-        LBM_LOAD_F_ALIGNED(3);
-        LBM_LOAD_F_ALIGNED(4);
-        LBM_LOAD_F_ALIGNED(5);
-        LBM_LOAD_F_ALIGNED(6);
-        LBM_LOAD_F_ALIGNED(7);
-        LBM_LOAD_F_ALIGNED(8);
-        LBM_LOAD_F_ALIGNED(9);
-        LBM_LOAD_F_ALIGNED(10);
-        LBM_LOAD_F_ALIGNED(11);
-        LBM_LOAD_F_ALIGNED(12);
-        LBM_LOAD_F_ALIGNED(13);
-        LBM_LOAD_F_ALIGNED(14);
-        LBM_LOAD_F_ALIGNED(15);
-        LBM_LOAD_F_ALIGNED(16);
-        LBM_LOAD_F_ALIGNED(17);
-        LBM_LOAD_F_ALIGNED(18);
-        LBM_LOAD_F_ALIGNED(19);
-        LBM_LOAD_F_ALIGNED(20);
-        LBM_LOAD_F_ALIGNED(21);
-        LBM_LOAD_F_ALIGNED(22);
-        LBM_LOAD_F_ALIGNED(23);
-        LBM_LOAD_F_ALIGNED(24);
-        LBM_LOAD_F_ALIGNED(25);
-        LBM_LOAD_F_ALIGNED(26);
-
-        const std::uint8_t type = node_type[tid];
-        if (type != kFluid) {
-            LBM_STORE_F_ALIGNED(0);
-            LBM_STORE_F_ALIGNED(1);
-            LBM_STORE_F_ALIGNED(2);
-            LBM_STORE_F_ALIGNED(3);
-            LBM_STORE_F_ALIGNED(4);
-            LBM_STORE_F_ALIGNED(5);
-            LBM_STORE_F_ALIGNED(6);
-            LBM_STORE_F_ALIGNED(7);
-            LBM_STORE_F_ALIGNED(8);
-            LBM_STORE_F_ALIGNED(9);
-            LBM_STORE_F_ALIGNED(10);
-            LBM_STORE_F_ALIGNED(11);
-            LBM_STORE_F_ALIGNED(12);
-            LBM_STORE_F_ALIGNED(13);
-            LBM_STORE_F_ALIGNED(14);
-            LBM_STORE_F_ALIGNED(15);
-            LBM_STORE_F_ALIGNED(16);
-            LBM_STORE_F_ALIGNED(17);
-            LBM_STORE_F_ALIGNED(18);
-            LBM_STORE_F_ALIGNED(19);
-            LBM_STORE_F_ALIGNED(20);
-            LBM_STORE_F_ALIGNED(21);
-            LBM_STORE_F_ALIGNED(22);
-            LBM_STORE_F_ALIGNED(23);
-            LBM_STORE_F_ALIGNED(24);
-            LBM_STORE_F_ALIGNED(25);
-            LBM_STORE_F_ALIGNED(26);
-            return;
-        }
-
-#if defined(LBM_BENCH_STORE_INPUT)
-        // Memory-path benchmark: preserve the 27 DF writes but skip collision math.
-#else
-        const Real fx = (cfg.mode == StreamwiseMode::PeriodicBodyForce) ? cfg.body_force_x : Real(0.0);
-        const Real fy = Real(0.0);
-        const Real fz = Real(0.0);
-        Real rho =
-            f_0 + f_1 + f_2 + f_3 + f_4 + f_5 + f_6 + f_7 + f_8 +
-            f_9 + f_10 + f_11 + f_12 + f_13 + f_14 + f_15 + f_16 + f_17 +
-            f_18 + f_19 + f_20 + f_21 + f_22 + f_23 + f_24 + f_25 + f_26;
-        rho = rho > Real(1.0e-20) ? rho : Real(1.0e-20);
-        const Real mx =
-            f_1 - f_2 + f_7 - f_8 + f_9 - f_10 + f_11 - f_12 + f_13 - f_14 +
-            f_19 - f_20 + f_21 - f_22 + f_23 - f_24 + f_25 - f_26;
-        const Real my =
-            f_3 - f_4 + f_7 - f_8 - f_9 + f_10 + f_15 - f_16 + f_17 - f_18 +
-            f_19 - f_20 + f_21 - f_22 - f_23 + f_24 - f_25 + f_26;
-        const Real mz =
-            f_5 - f_6 + f_11 - f_12 - f_13 + f_14 + f_15 - f_16 - f_17 + f_18 +
-            f_19 - f_20 - f_21 + f_22 + f_23 - f_24 - f_25 + f_26;
-        const Real ux = (mx + Real(0.5) * fx) / rho;
-        const Real uy = (my + Real(0.5) * fy) / rho;
-        const Real uz = (mz + Real(0.5) * fz) / rho;
-        const Real uu = ux * ux + uy * uy + uz * uz;
-        LBM_BENCH_ACCUM_DECL;
-#endif
-
-        LBM_COLLIDE_UPDATE(0);
-        LBM_COLLIDE_UPDATE(1);
-        LBM_COLLIDE_UPDATE(2);
-        LBM_COLLIDE_UPDATE(3);
-        LBM_COLLIDE_UPDATE(4);
-        LBM_COLLIDE_UPDATE(5);
-        LBM_COLLIDE_UPDATE(6);
-        LBM_COLLIDE_UPDATE(7);
-        LBM_COLLIDE_UPDATE(8);
-        LBM_COLLIDE_UPDATE(9);
-        LBM_COLLIDE_UPDATE(10);
-        LBM_COLLIDE_UPDATE(11);
-        LBM_COLLIDE_UPDATE(12);
-        LBM_COLLIDE_UPDATE(13);
-        LBM_COLLIDE_UPDATE(14);
-        LBM_COLLIDE_UPDATE(15);
-        LBM_COLLIDE_UPDATE(16);
-        LBM_COLLIDE_UPDATE(17);
-        LBM_COLLIDE_UPDATE(18);
-        LBM_COLLIDE_UPDATE(19);
-        LBM_COLLIDE_UPDATE(20);
-        LBM_COLLIDE_UPDATE(21);
-        LBM_COLLIDE_UPDATE(22);
-        LBM_COLLIDE_UPDATE(23);
-        LBM_COLLIDE_UPDATE(24);
-        LBM_COLLIDE_UPDATE(25);
-        LBM_COLLIDE_UPDATE(26);
-#if !defined(LBM_BENCH_COMPUTE_ONLY)
-        LBM_STORE_F_ALIGNED(0);
-        LBM_STORE_F_ALIGNED(1);
-        LBM_STORE_F_ALIGNED(2);
-        LBM_STORE_F_ALIGNED(3);
-        LBM_STORE_F_ALIGNED(4);
-        LBM_STORE_F_ALIGNED(5);
-        LBM_STORE_F_ALIGNED(6);
-        LBM_STORE_F_ALIGNED(7);
-        LBM_STORE_F_ALIGNED(8);
-        LBM_STORE_F_ALIGNED(9);
-        LBM_STORE_F_ALIGNED(10);
-        LBM_STORE_F_ALIGNED(11);
-        LBM_STORE_F_ALIGNED(12);
-        LBM_STORE_F_ALIGNED(13);
-        LBM_STORE_F_ALIGNED(14);
-        LBM_STORE_F_ALIGNED(15);
-        LBM_STORE_F_ALIGNED(16);
-        LBM_STORE_F_ALIGNED(17);
-        LBM_STORE_F_ALIGNED(18);
-        LBM_STORE_F_ALIGNED(19);
-        LBM_STORE_F_ALIGNED(20);
-        LBM_STORE_F_ALIGNED(21);
-        LBM_STORE_F_ALIGNED(22);
-        LBM_STORE_F_ALIGNED(23);
-        LBM_STORE_F_ALIGNED(24);
-        LBM_STORE_F_ALIGNED(25);
-        LBM_STORE_F_ALIGNED(26);
-#else
-        LBM_BENCH_FLUSH_ALIGNED();
-#endif
-    }
-}
 
 __global__ __launch_bounds__(kLaunchBounds) void recover_macros_kernel(
     StreamingView view,
