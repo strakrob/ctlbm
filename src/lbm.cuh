@@ -1,8 +1,6 @@
 #pragma once
 
-#if defined(LBM_USE_VMM_STREAMING)
 #include <cuda.h>
-#endif
 #include <cuda_runtime.h>
 
 #include <array>
@@ -49,15 +47,10 @@ constexpr Real kInvCs4 = Real(9.0);
 #define LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz) ((((z) * (ny)) + (y)) * (nx) + (x))
 #define LBM_DISTRIBUTION_INDEX(q, cell, cell_count) ((q) * (cell_count) + (cell))
 
-// The solver keeps one physical distribution storage array of size Q * N.
-// Streaming is expressed purely by changing per-direction logical shifts.
-// A logical access (q, x, y, z) is translated to a physical cell index with
-// `physical_cell_index`, so reviewers can verify that no second DF field exists.
-//
-// When LBM_USE_VMM_STREAMING is enabled, the same one-array-per-population SoA
-// design is kept, but each population array is mapped twice into one virtual
-// address reservation. The control structure then becomes an array of
-// per-population start pointers instead of per-population x/y/z shift vectors.
+// The solver keeps one physical population array per D3Q27 direction.
+// Each population array is mapped twice into a reserved GPU virtual address
+// range so streaming can be realized by advancing one per-population start
+// pointer. No ping-pong DF storage or source/destination swap exists.
 
 enum class StreamwiseMode : int {
     PeriodicBodyForce = 0,
@@ -109,14 +102,7 @@ struct SimulationConfig {
 };
 
 struct StreamingView {
-#if defined(LBM_USE_VMM_STREAMING)
     Real* const* population = nullptr;
-#else
-    Real* population = nullptr;
-    const int* sx = nullptr;
-    const int* sy = nullptr;
-    const int* sz = nullptr;
-#endif
 };
 
 inline constexpr std::array<int, kQ> kCx = {
@@ -163,37 +149,6 @@ inline void cuda_check(cudaError_t error, const char* what) {
     }
 }
 
-__host__ __device__ LBM_FORCEINLINE int wrap_index(int value, int extent) {
-    value %= extent;
-    if (value < 0) {
-        value += extent;
-    }
-    return value;
-}
-
-// Hot-path helper for periodic-shift addressing. During the simulation, `coord`
-// and `shift` are both already in `[0, extent)`, so only one conditional
-// adjustment is needed and we avoid `%` in the kernels.
-__host__ __device__ LBM_FORCEINLINE int shifted_index(int coord, int shift, int extent) {
-    int value = coord - shift;
-    if (value < 0) {
-        value += extent;
-    }
-    return value;
-}
-
-// Shift updates only advance by one lattice link per step, so the result is at
-// most one period outside the valid range.
-__host__ __device__ LBM_FORCEINLINE int advance_shift_index(int shift, int direction, int extent) {
-    int value = shift + direction;
-    if (value >= extent) {
-        value -= extent;
-    } else if (value < 0) {
-        value += extent;
-    }
-    return value;
-}
-
 __host__ __device__ LBM_FORCEINLINE int flatten_xyz(int x, int y, int z, int nx, int ny, int nz) {
     return LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
 }
@@ -204,23 +159,6 @@ __host__ __device__ LBM_FORCEINLINE int distribution_index(int q, int cell, int 
 
 inline int streaming_linear_offset(int q, const SimulationConfig& cfg) {
     return kCx[q] + kCy[q] * cfg.nx + kCz[q] * cfg.nx * cfg.ny;
-}
-
-__host__ __device__ LBM_FORCEINLINE int physical_cell_index(
-    int q,
-    int x,
-    int y,
-    int z,
-    int nx,
-    int ny,
-    int nz,
-    const int* sx,
-    const int* sy,
-    const int* sz) {
-    const int px = shifted_index(x, sx[q], nx);
-    const int py = shifted_index(y, sy[q], ny);
-    const int pz = shifted_index(z, sz[q], nz);
-    return LBM_FLATTEN_XYZ(px, py, pz, nx, ny, nz);
 }
 
 __host__ __device__ LBM_FORCEINLINE int interior_area(const SimulationConfig& cfg) {

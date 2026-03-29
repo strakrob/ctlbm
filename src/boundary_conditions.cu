@@ -121,20 +121,11 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     int ny,
     int nz,
     Real* LBM_RESTRICT populations) {
-#if defined(LBM_USE_VMM_STREAMING)
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         populations[q] = view.population[q][cell];
     }
-#else
-    const int cell_count = nx * ny * nz;
-    #pragma unroll
-    for (int q = 0; q < kQ; ++q) {
-        const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
-        populations[q] = view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)];
-    }
-#endif
 }
 
 __device__ LBM_FORCEINLINE void store_logical_population(
@@ -147,14 +138,8 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     int ny,
     int nz,
     Real value) {
-#if defined(LBM_USE_VMM_STREAMING)
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
     view.population[q][cell] = value;
-#else
-    const int cell_count = nx * ny * nz;
-    const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
-    view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)] = value;
-#endif
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(
@@ -269,7 +254,6 @@ __global__ __launch_bounds__(kLaunchBounds) void apply_pressure_boundaries_kerne
     }
 }
 
-#if defined(LBM_USE_VMM_STREAMING)
 __global__ __launch_bounds__(kLaunchBounds) void gather_periodic_x_planes_kernel(
     StreamingView view,
     SimulationConfig cfg,
@@ -323,7 +307,6 @@ __global__ __launch_bounds__(kLaunchBounds) void scatter_periodic_x_planes_kerne
         }
     }
 }
-#endif
 
 __global__ __launch_bounds__(kLaunchBounds) void apply_velocity_boundaries_kernel(
     StreamingView view,
@@ -427,7 +410,6 @@ void launch_apply_periodic_x_boundaries(
     const SimulationConfig& cfg,
     Real* d_xmin_plane,
     Real* d_xmax_plane) {
-#if defined(LBM_USE_VMM_STREAMING)
     dim3 grid{};
     dim3 block{};
     yz_launch_config(cfg, &grid, &block);
@@ -435,12 +417,6 @@ void launch_apply_periodic_x_boundaries(
     cuda_check(cudaGetLastError(), "launch gather_periodic_x_planes_kernel");
     scatter_periodic_x_planes_kernel<<<grid, block>>>(view, cfg, d_xmin_plane, d_xmax_plane);
     cuda_check(cudaGetLastError(), "launch scatter_periodic_x_planes_kernel");
-#else
-    (void)view;
-    (void)cfg;
-    (void)d_xmin_plane;
-    (void)d_xmax_plane;
-#endif
 }
 
 void launch_apply_velocity_boundaries(

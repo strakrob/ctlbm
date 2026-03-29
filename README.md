@@ -6,13 +6,14 @@ This repository implements a CUDA C/C++ lattice Boltzmann solver for 3D incompre
 - SRT / BGK collision.
 - double precision by default, optional single precision via `-DLBM_USE_FLOAT=ON`.
 - one distribution-function storage set only.
-- periodic-shift streaming with per-population logical offsets.
+- periodic-shift streaming with CUDA virtual-memory-mapped population arrays.
 - `.vti` output for ParaView.
 - three selectable streamwise boundary-condition modes.
 
 ## What “single-grid periodic-shift” means here
 
-The solver keeps exactly one physical DF array of size `Q * Nx * Ny * Nz`.
+The solver keeps exactly one physical population array per D3Q27 direction, for
+a total DF storage of `Q * Nx * Ny * Nz`.
 
 It does **not** use:
 
@@ -20,42 +21,28 @@ It does **not** use:
 - source/destination swaps,
 - pull/push double buffering.
 
-By default, each population `q` carries cumulative logical shifts `sx[q]`, `sy[q]`, `sz[q]`. A logical access to `(q, x, y, z)` is mapped to physical storage by:
-
-```text
-physical_x = wrap(x - sx[q], Nx)
-physical_y = wrap(y - sy[q], Ny)
-physical_z = wrap(z - sz[q], Nz)
-```
-
-At every timestep the host updates the shift vectors by the discrete velocity:
-
-```text
-sx[q] <- wrap(sx[q] + cx[q], Nx)
-sy[q] <- wrap(sy[q] + cy[q], Ny)
-sz[q] <- wrap(sz[q] + cz[q], Nz)
-```
+Each population array is mapped twice into one reserved GPU virtual address
+range with `cuMemAddressReserve`, `cuMemCreate`, and `cuMemMap`. The runtime
+control structure is an array of per-population start pointers. At every
+timestep the host advances each pointer by the invariant linear D3Q27 offset
+`cx[q] + cy[q] * Nx + cz[q] * Nx * Ny`, wrapped inside the doubled virtual
+address range.
 
 The collision kernel then:
 
-1. reads the logical field at time `t` via the previous shifts,
+1. reads the logical field at time `t` through the current per-population start pointers,
 2. computes macroscopic fields, equilibrium, BGK collision, and Guo forcing if enabled,
-3. writes the post-collision state back through the new shifts.
+3. writes the post-collision state back through the same logical view.
 
-That write is the streamed state at `t + 1`, still inside the same DF array.
-
-An optional compile-time backend, `-DLBM_USE_VMM_STREAMING=ON`, replaces the
-shift vectors with CUDA virtual-memory-mapped per-population start pointers.
-Each D3Q27 population array is mapped twice into one reserved GPU virtual
-address range, and the host advances those pointers by the linear D3Q27 offset
-after each timestep. Because the solver still uses the explicit rectangular
-`(x, y, z)` indexing elsewhere, the Mode A VMM path applies an additional
-periodic `x`-plane repair before the wall bounce-back kernel.
+That write is the streamed state at `t + 1`, still inside the same DF storage.
+Because the solver still uses explicit rectangular `(x, y, z)` indexing
+elsewhere, Mode A applies an additional periodic `x`-plane repair before the
+wall bounce-back kernel.
 
 ## Source layout
 
-- `src/lbm.cuh`: shared types, D3Q27 constants, indexing helpers, shift-address mapping.
-- `src/lbm_kernels.cu`: initialization, macroscopic recovery, BGK collision, Guo forcing, shift-streaming.
+- `src/lbm.cuh`: shared types, D3Q27 constants, indexing helpers, VMM streaming declarations.
+- `src/lbm_kernels.cu`: initialization, macroscopic recovery, BGK collision, Guo forcing, VMM streaming.
 - `src/boundary_conditions.cu`: wall bounce-back, pressure inlet/outlet, velocity inlet, outlet treatments.
 - `src/vti_writer.cu`: ASCII VTK ImageData output.
 - `src/main.cu`: CLI, timestep loop, diagnostics, validation metrics.
@@ -99,9 +86,9 @@ Implemented outlet variants:
 
 Each timestep uses this order:
 
-1. collide and stream in place while reading and writing through the current logical shifts,
-2. advance the logical shifts on the host,
-3. when `LBM_USE_VMM_STREAMING=ON` and Mode A is active, repair the periodic `x` planes,
+1. collide and stream in place while reading and writing through the current logical view,
+2. advance the per-population VMM start pointers on the host,
+3. when Mode A is active, repair the periodic `x` planes,
 4. apply wall bounce-back on y/z wall nodes,
 5. apply streamwise inlet/outlet reconstruction for Mode B or Mode C,
 6. recover `rho`, `ux`, `uy`, `uz` for diagnostics and output when requested.
@@ -154,14 +141,7 @@ When `LBM_USE_3D_TOPOLOGY=ON`:
 - yz-plane boundary kernels use `block = (Ny, 1, 1)`, `grid = (Nz, 1, 1)`,
 - this requires `Nx <= 1024` and `Ny <= 1024`.
 
-Optional CUDA virtual-memory streaming backend:
-
-```bash
-cmake -S . -B build -DLBM_USE_VMM_STREAMING=ON
-cmake --build build -j
-```
-
-When `LBM_USE_VMM_STREAMING=ON`:
+The solver always uses the CUDA virtual-memory streaming backend:
 
 - the solver links the CUDA Driver API and uses `cuMemAddressReserve` /
   `cuMemCreate` / `cuMemMap` for the population arrays,

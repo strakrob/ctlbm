@@ -71,7 +71,6 @@ struct MemoryReport {
 
 struct DistributionStorage {
     lbm::StreamingView view{};
-#if defined(LBM_USE_VMM_STREAMING)
     CUdeviceptr reservation = 0;
     std::size_t population_bytes = 0;
     std::size_t population_cells = 0;
@@ -82,15 +81,6 @@ struct DistributionStorage {
     Real** d_population = nullptr;
     Real* d_xmin_plane = nullptr;
     Real* d_xmax_plane = nullptr;
-#else
-    Real* d_field = nullptr;
-    int* d_sx = nullptr;
-    int* d_sy = nullptr;
-    int* d_sz = nullptr;
-    std::array<int, lbm::kQ> shift_x{};
-    std::array<int, lbm::kQ> shift_y{};
-    std::array<int, lbm::kQ> shift_z{};
-#endif
 };
 
 std::string to_lower(std::string value) {
@@ -125,11 +115,7 @@ std::string format_bytes(std::size_t bytes) {
 }
 
 std::string streaming_backend_name() {
-#if defined(LBM_USE_VMM_STREAMING)
     return "cuda-vmm";
-#else
-    return "logical-shifts";
-#endif
 }
 
 [[noreturn]] void usage_and_exit(const char* program) {
@@ -451,9 +437,8 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     const std::size_t q_field_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cell_count);
     const std::size_t scalar_field_bytes = sizeof(Real) * static_cast<std::size_t>(cell_count);
     const std::size_t node_type_bytes = sizeof(std::uint8_t) * static_cast<std::size_t>(cell_count);
-    // The physical DF demand is unchanged across both streaming backends:
-    // one population array per D3Q27 direction and no ping-pong copy.
-#if defined(LBM_USE_VMM_STREAMING)
+    // The physical DF demand is one population array per D3Q27 direction and
+    // no ping-pong copy.
     const std::size_t pointer_bytes = sizeof(Real*) * static_cast<std::size_t>(lbm::kQ);
     const std::size_t periodic_plane_bytes =
         2 * sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.ny * cfg.nz);
@@ -473,24 +458,6 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
         node_type_bytes +
         pointer_bytes +
         periodic_plane_bytes;
-#else
-    const std::size_t shift_bytes = sizeof(int) * static_cast<std::size_t>(lbm::kQ);
-
-    // Host-side persistent buffers: node map, four macroscopic output fields,
-    // and the three logical shift vectors stored on the host.
-    report.host_bytes =
-        node_type_bytes +
-        4 * scalar_field_bytes +
-        3 * shift_bytes;
-
-    // GPU-side persistent buffers: one DF storage set, four macro fields used
-    // for diagnostics/output, the node-type field, and the shift vectors.
-    report.gpu_bytes =
-        q_field_bytes +
-        4 * scalar_field_bytes +
-        node_type_bytes +
-        3 * shift_bytes;
-#endif
 
     report.total_bytes = report.host_bytes + report.gpu_bytes;
     report.host_bytes_per_cell = static_cast<double>(report.host_bytes) / static_cast<double>(cell_count);
@@ -499,7 +466,6 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     return report;
 }
 
-#if defined(LBM_USE_VMM_STREAMING)
 std::string cu_result_text(CUresult result) {
     const char* error_name = nullptr;
     const char* error_string = nullptr;
@@ -534,7 +500,7 @@ void initialize_distribution_storage(const SimulationConfig& cfg, DistributionSt
         cuDeviceGetAttribute(&vmm_supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device),
         "query VMM support");
     if (vmm_supported == 0) {
-        throw std::runtime_error("LBM_USE_VMM_STREAMING is enabled, but the active GPU does not support CUDA virtual memory management.");
+        throw std::runtime_error("The active GPU does not support CUDA virtual memory management.");
     }
 
     CUmemAllocationProp allocation{};
@@ -550,7 +516,7 @@ void initialize_distribution_storage(const SimulationConfig& cfg, DistributionSt
     const std::size_t population_bytes = sizeof(Real) * static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz);
     if (population_bytes % granularity != 0) {
         std::ostringstream os;
-        os << "LBM_USE_VMM_STREAMING requires the per-population byte size (" << population_bytes
+        os << "The VMM streaming backend requires the per-population byte size (" << population_bytes
            << ") to be a multiple of the CUDA VMM granularity (" << granularity << ").";
         throw std::runtime_error(os.str());
     }
@@ -651,53 +617,6 @@ void destroy_distribution_storage(DistributionStorage* storage) {
         cu_check(cuMemAddressFree(storage->reservation, reservation_bytes), "free VMM address reservation");
     }
 }
-#else
-void initialize_distribution_storage(const SimulationConfig& cfg, DistributionStorage* storage) {
-    const std::size_t q_field_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz);
-    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_field), q_field_bytes), "allocate DF field");
-    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_sx), sizeof(int) * lbm::kQ), "allocate x shifts");
-    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_sy), sizeof(int) * lbm::kQ), "allocate y shifts");
-    lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_sz), sizeof(int) * lbm::kQ), "allocate z shifts");
-    lbm::cuda_check(cudaMemcpy(storage->d_sx, storage->shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial x shifts");
-    lbm::cuda_check(cudaMemcpy(storage->d_sy, storage->shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial y shifts");
-    lbm::cuda_check(cudaMemcpy(storage->d_sz, storage->shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "copy initial z shifts");
-
-    storage->view.population = storage->d_field;
-    storage->view.sx = storage->d_sx;
-    storage->view.sy = storage->d_sy;
-    storage->view.sz = storage->d_sz;
-}
-
-void advance_streaming_state(const SimulationConfig& cfg, DistributionStorage* storage) {
-    // After collide-and-stream has written into the next logical shift layout,
-    // the host advances the cumulative offsets so all subsequent accesses use
-    // that new streamed state.
-    for (int q = 0; q < lbm::kQ; ++q) {
-        storage->shift_x[q] = lbm::advance_shift_index(storage->shift_x[q], lbm::kCx[q], cfg.nx);
-        storage->shift_y[q] = lbm::advance_shift_index(storage->shift_y[q], lbm::kCy[q], cfg.ny);
-        storage->shift_z[q] = lbm::advance_shift_index(storage->shift_z[q], lbm::kCz[q], cfg.nz);
-    }
-
-    lbm::cuda_check(cudaMemcpy(storage->d_sx, storage->shift_x.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update x shifts");
-    lbm::cuda_check(cudaMemcpy(storage->d_sy, storage->shift_y.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update y shifts");
-    lbm::cuda_check(cudaMemcpy(storage->d_sz, storage->shift_z.data(), sizeof(int) * lbm::kQ, cudaMemcpyHostToDevice), "update z shifts");
-}
-
-void destroy_distribution_storage(DistributionStorage* storage) {
-    if (storage->d_field != nullptr) {
-        lbm::cuda_check(cudaFree(storage->d_field), "free DF field");
-    }
-    if (storage->d_sx != nullptr) {
-        lbm::cuda_check(cudaFree(storage->d_sx), "free x shifts");
-    }
-    if (storage->d_sy != nullptr) {
-        lbm::cuda_check(cudaFree(storage->d_sy), "free y shifts");
-    }
-    if (storage->d_sz != nullptr) {
-        lbm::cuda_check(cudaFree(storage->d_sz), "free z shifts");
-    }
-}
-#endif
 
 void print_memory_report(const MemoryReport& report) {
     std::cout << "Memory demand per simulation"
@@ -830,9 +749,7 @@ int main(int argc, char** argv) {
                   << " do-not-write-full-volume=" << (runtime.do_not_write_full_volume ? "on" : "off")
                   << '\n';
         print_memory_report(memory_report);
-#if defined(LBM_USE_VMM_STREAMING)
         std::cout << "CUDA VMM population granularity=" << distribution_storage.granularity_bytes << " B\n";
-#endif
 
         Real previous_bulk_velocity = Real(0.0);
         const Diagnostics initial_diagnostics = recover_to_host(0, true, Real(0.0), &previous_bulk_velocity);
@@ -845,7 +762,6 @@ int main(int argc, char** argv) {
             advance_streaming_state(cfg, &distribution_storage);
             // Boundary reconstruction always runs after the streamed field exists
             // in logical form at the current shift state.
-#if defined(LBM_USE_VMM_STREAMING)
             if (cfg.mode == StreamwiseMode::PeriodicBodyForce) {
                 lbm::launch_apply_periodic_x_boundaries(
                     distribution_storage.view,
@@ -853,7 +769,6 @@ int main(int argc, char** argv) {
                     distribution_storage.d_xmin_plane,
                     distribution_storage.d_xmax_plane);
             }
-#endif
             lbm::launch_apply_wall_boundaries(distribution_storage.view, d_node_type, cfg);
             if (cfg.mode == StreamwiseMode::Pressure) {
                 lbm::launch_apply_pressure_boundaries(distribution_storage.view, d_node_type, cfg);

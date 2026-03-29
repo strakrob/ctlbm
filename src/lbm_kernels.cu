@@ -82,21 +82,11 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     int ny,
     int nz,
     Real* LBM_RESTRICT populations) {
-#if defined(LBM_USE_VMM_STREAMING)
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         populations[q] = view.population[q][cell];
     }
-#else
-    const int cell_count = nx * ny * nz;
-    #pragma unroll
-    for (int q = 0; q < kQ; ++q) {
-        // The logical field for direction q is stored with its own running shift.
-        const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
-        populations[q] = view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)];
-    }
-#endif
 }
 
 __device__ LBM_FORCEINLINE void store_logical_population(
@@ -109,14 +99,8 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     int ny,
     int nz,
     Real value) {
-#if defined(LBM_USE_VMM_STREAMING)
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
     view.population[q][cell] = value;
-#else
-    const int cell_count = nx * ny * nz;
-    const int physical_cell = physical_cell_index(q, x, y, z, nx, ny, nz, view.sx, view.sy, view.sz);
-    view.population[LBM_DISTRIBUTION_INDEX(q, physical_cell, cell_count)] = value;
-#endif
 }
 
 __device__ LBM_FORCEINLINE void recover_macro_from_populations(
@@ -252,10 +236,10 @@ __global__ __launch_bounds__(kLaunchBounds) void collide_and_stream_kernel(
         const Real feq = equilibrium(q, rho, ux, uy, uz);
         const Real force_term = guo_force_term(q, ux, uy, uz, fx, fy, fz, cfg.omega);
         const Real post_collision = populations[q] - cfg.omega * (populations[q] - feq) + force_term;
-        // In periodic-shift streaming the post-collision value stays in the
-        // current logical slot. The host then advances either the per-direction
-        // shifts or the per-population VMM base pointers, so the next logical
-        // access observes the streamed neighbour without a second DF array.
+        // In VMM streaming the post-collision value stays in the current
+        // logical slot. The host then advances the per-population start
+        // pointers, so the next logical access observes the streamed neighbour
+        // without a second DF array.
         store_logical_population(view, q, x, y, z, cfg.nx, cfg.ny, cfg.nz, post_collision);
     }
 }
