@@ -103,6 +103,8 @@ struct SimulationConfig {
 
 struct StreamingView {
     Real* const* population = nullptr;
+    const int* offset = nullptr;
+    int logical_cells = 0;
 };
 
 inline constexpr std::array<int, kQ> kCx = {

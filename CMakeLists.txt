@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-option(LBM_USE_FLOAT "Build the solver in single precision instead of double precision." ON)
+option(LBM_USE_FLOAT "Build the solver in single precision instead of double precision." OFF)
 option(LBM_USE_3D_TOPOLOGY "Use the x-major 3D CUDA launch topology instead of the default 1D launch." OFF)
 
 add_executable(lbmd3q27

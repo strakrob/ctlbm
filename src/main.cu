@@ -72,13 +72,17 @@ struct MemoryReport {
 struct DistributionStorage {
     lbm::StreamingView view{};
     CUdeviceptr reservation = 0;
+    std::size_t allocation_bytes = 0;
     std::size_t population_bytes = 0;
     std::size_t population_cells = 0;
     std::size_t granularity_bytes = 0;
+    bool uses_offset_fallback = false;
     std::array<CUmemGenericAllocationHandle, lbm::kQ> handles{};
     std::array<Real*, lbm::kQ> base{};
     std::array<Real*, lbm::kQ> current{};
+    std::array<int, lbm::kQ> offset{};
     Real** d_population = nullptr;
+    int* d_offset = nullptr;
     Real* d_xmin_plane = nullptr;
     Real* d_xmax_plane = nullptr;
 };
@@ -440,6 +444,7 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     // The physical DF demand is one population array per D3Q27 direction and
     // no ping-pong copy.
     const std::size_t pointer_bytes = sizeof(Real*) * static_cast<std::size_t>(lbm::kQ);
+    const std::size_t offset_bytes = sizeof(int) * static_cast<std::size_t>(lbm::kQ);
     const std::size_t periodic_plane_bytes =
         2 * sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.ny * cfg.nz);
 
@@ -448,7 +453,8 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
     report.host_bytes =
         node_type_bytes +
         4 * scalar_field_bytes +
-        2 * pointer_bytes;
+        2 * pointer_bytes +
+        offset_bytes;
 
     // GPU-side persistent buffers: the DF field, four macro fields, the node
     // type field, and the device copy of the per-population pointer table.
@@ -457,6 +463,7 @@ MemoryReport build_memory_report(const SimulationConfig& cfg, int cell_count) {
         4 * scalar_field_bytes +
         node_type_bytes +
         pointer_bytes +
+        offset_bytes +
         periodic_plane_bytes;
 
     report.total_bytes = report.host_bytes + report.gpu_bytes;
@@ -514,26 +521,23 @@ void initialize_distribution_storage(const SimulationConfig& cfg, DistributionSt
         "query CUDA VMM allocation granularity");
 
     const std::size_t population_bytes = sizeof(Real) * static_cast<std::size_t>(cfg.nx * cfg.ny * cfg.nz);
-    if (population_bytes % granularity != 0) {
-        std::ostringstream os;
-        os << "The VMM streaming backend requires the per-population byte size (" << population_bytes
-           << ") to be a multiple of the CUDA VMM granularity (" << granularity << ").";
-        throw std::runtime_error(os.str());
-    }
+    const std::size_t allocation_bytes = ((population_bytes + granularity - 1) / granularity) * granularity;
+    storage->uses_offset_fallback = (population_bytes != allocation_bytes);
 
+    storage->allocation_bytes = allocation_bytes;
     storage->population_bytes = population_bytes;
     storage->population_cells = population_bytes / sizeof(Real);
     storage->granularity_bytes = granularity;
 
-    const std::size_t reservation_bytes = 2 * static_cast<std::size_t>(lbm::kQ) * population_bytes;
+    const std::size_t reservation_bytes = 2 * static_cast<std::size_t>(lbm::kQ) * allocation_bytes;
     cu_check(cuMemAddressReserve(&storage->reservation, reservation_bytes, 0, 0, 0), "reserve VMM address space");
 
     for (int q = 0; q < lbm::kQ; ++q) {
-        cu_check(cuMemCreate(&storage->handles[q], population_bytes, &allocation, 0), "create VMM population allocation");
+        cu_check(cuMemCreate(&storage->handles[q], allocation_bytes, &allocation, 0), "create VMM population allocation");
 
-        const CUdeviceptr base_ptr = storage->reservation + static_cast<CUdeviceptr>(2 * static_cast<std::size_t>(q) * population_bytes);
-        cu_check(cuMemMap(base_ptr, population_bytes, 0, storage->handles[q], 0), "map primary VMM population view");
-        cu_check(cuMemMap(base_ptr + population_bytes, population_bytes, 0, storage->handles[q], 0), "map aliased VMM population view");
+        const CUdeviceptr base_ptr = storage->reservation + static_cast<CUdeviceptr>(2 * static_cast<std::size_t>(q) * allocation_bytes);
+        cu_check(cuMemMap(base_ptr, allocation_bytes, 0, storage->handles[q], 0), "map primary VMM population view");
+        cu_check(cuMemMap(base_ptr + allocation_bytes, allocation_bytes, 0, storage->handles[q], 0), "map aliased VMM population view");
 
         storage->base[q] = reinterpret_cast<Real*>(base_ptr);
         storage->current[q] = storage->base[q];
@@ -549,32 +553,64 @@ void initialize_distribution_storage(const SimulationConfig& cfg, DistributionSt
         cudaMalloc(reinterpret_cast<void**>(&storage->d_population), sizeof(Real*) * static_cast<std::size_t>(lbm::kQ)),
         "allocate VMM population pointer table");
     lbm::cuda_check(
+        cudaMalloc(reinterpret_cast<void**>(&storage->d_offset), sizeof(int) * static_cast<std::size_t>(lbm::kQ)),
+        "allocate VMM population offset table");
+    lbm::cuda_check(
         cudaMemcpy(
             storage->d_population,
-            storage->current.data(),
+            storage->base.data(),
             sizeof(Real*) * static_cast<std::size_t>(lbm::kQ),
             cudaMemcpyHostToDevice),
-        "copy initial VMM population pointers");
+        "copy VMM population base pointers");
+    lbm::cuda_check(
+        cudaMemcpy(
+            storage->d_offset,
+            storage->offset.data(),
+            sizeof(int) * static_cast<std::size_t>(lbm::kQ),
+            cudaMemcpyHostToDevice),
+        "copy initial VMM population offsets");
     const std::size_t periodic_plane_bytes = sizeof(Real) * static_cast<std::size_t>(lbm::kQ) * static_cast<std::size_t>(cfg.ny * cfg.nz);
     lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_xmin_plane), periodic_plane_bytes), "allocate periodic xmin plane buffer");
     lbm::cuda_check(cudaMalloc(reinterpret_cast<void**>(&storage->d_xmax_plane), periodic_plane_bytes), "allocate periodic xmax plane buffer");
 
     storage->view.population = storage->d_population;
+    storage->view.offset = storage->uses_offset_fallback ? storage->d_offset : nullptr;
+    storage->view.logical_cells = static_cast<int>(storage->population_cells);
 }
 
 void advance_streaming_state(const SimulationConfig& cfg, DistributionStorage* storage) {
-    const std::ptrdiff_t logical_cells = static_cast<std::ptrdiff_t>(storage->population_cells);
+    const int logical_cells = static_cast<int>(storage->population_cells);
 
-    // Streaming is a pure control-structure update: each population pointer is
-    // rotated by its invariant linear D3Q27 offset inside the doubled virtual
-    // address range.
+    if (storage->uses_offset_fallback) {
+        for (int q = 0; q < lbm::kQ; ++q) {
+            int next_offset = storage->offset[q] - lbm::streaming_linear_offset(q, cfg);
+            next_offset %= logical_cells;
+            if (next_offset < 0) {
+                next_offset += logical_cells;
+            }
+            storage->offset[q] = next_offset;
+        }
+        lbm::cuda_check(
+            cudaMemcpy(
+                storage->d_offset,
+                storage->offset.data(),
+                sizeof(int) * static_cast<std::size_t>(lbm::kQ),
+                cudaMemcpyHostToDevice),
+            "update VMM population offsets");
+        return;
+    }
+
+    const std::ptrdiff_t logical_span = static_cast<std::ptrdiff_t>(storage->population_cells);
+
+    // Aligned case: streaming is a pure pointer update inside the doubled VMM
+    // reservation, so kernels do plain pointer+cell indexing with no modulo.
     for (int q = 0; q < lbm::kQ; ++q) {
         const std::ptrdiff_t shift = -static_cast<std::ptrdiff_t>(lbm::streaming_linear_offset(q, cfg));
         storage->current[q] += shift;
         if (storage->current[q] < storage->base[q]) {
-            storage->current[q] += logical_cells;
-        } else if (storage->current[q] + logical_cells > storage->base[q] + 2 * logical_cells) {
-            storage->current[q] -= logical_cells;
+            storage->current[q] += logical_span;
+        } else if (storage->current[q] + logical_span > storage->base[q] + 2 * logical_span) {
+            storage->current[q] -= logical_span;
         }
     }
 
@@ -597,12 +633,15 @@ void destroy_distribution_storage(DistributionStorage* storage) {
     if (storage->d_population != nullptr) {
         lbm::cuda_check(cudaFree(storage->d_population), "free VMM population pointer table");
     }
+    if (storage->d_offset != nullptr) {
+        lbm::cuda_check(cudaFree(storage->d_offset), "free VMM population offset table");
+    }
 
-    if (storage->reservation != 0 && storage->population_bytes != 0) {
+    if (storage->reservation != 0 && storage->allocation_bytes != 0) {
         for (int q = 0; q < lbm::kQ; ++q) {
-            const CUdeviceptr base_ptr = storage->reservation + static_cast<CUdeviceptr>(2 * static_cast<std::size_t>(q) * storage->population_bytes);
-            cu_check(cuMemUnmap(base_ptr, storage->population_bytes), "unmap primary VMM population view");
-            cu_check(cuMemUnmap(base_ptr + storage->population_bytes, storage->population_bytes), "unmap aliased VMM population view");
+            const CUdeviceptr base_ptr = storage->reservation + static_cast<CUdeviceptr>(2 * static_cast<std::size_t>(q) * storage->allocation_bytes);
+            cu_check(cuMemUnmap(base_ptr, storage->allocation_bytes), "unmap primary VMM population view");
+            cu_check(cuMemUnmap(base_ptr + storage->allocation_bytes, storage->allocation_bytes), "unmap aliased VMM population view");
         }
     }
 
@@ -612,8 +651,8 @@ void destroy_distribution_storage(DistributionStorage* storage) {
         }
     }
 
-    if (storage->reservation != 0 && storage->population_bytes != 0) {
-        const std::size_t reservation_bytes = 2 * static_cast<std::size_t>(lbm::kQ) * storage->population_bytes;
+    if (storage->reservation != 0 && storage->allocation_bytes != 0) {
+        const std::size_t reservation_bytes = 2 * static_cast<std::size_t>(lbm::kQ) * storage->allocation_bytes;
         cu_check(cuMemAddressFree(storage->reservation, reservation_bytes), "free VMM address reservation");
     }
 }
@@ -749,7 +788,9 @@ int main(int argc, char** argv) {
                   << " do-not-write-full-volume=" << (runtime.do_not_write_full_volume ? "on" : "off")
                   << '\n';
         print_memory_report(memory_report);
-        std::cout << "CUDA VMM population granularity=" << distribution_storage.granularity_bytes << " B\n";
+        std::cout << "CUDA VMM population granularity=" << distribution_storage.granularity_bytes
+                  << " B control=" << (distribution_storage.uses_offset_fallback ? "padded-offsets" : "direct-alias")
+                  << '\n';
 
         Real previous_bulk_velocity = Real(0.0);
         const Diagnostics initial_diagnostics = recover_to_host(0, true, Real(0.0), &previous_bulk_velocity);

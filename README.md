@@ -21,12 +21,13 @@ It does **not** use:
 - source/destination swaps,
 - pull/push double buffering.
 
-Each population array is mapped twice into one reserved GPU virtual address
-range with `cuMemAddressReserve`, `cuMemCreate`, and `cuMemMap`. The runtime
-control structure is an array of per-population start pointers. At every
-timestep the host advances each pointer by the invariant linear D3Q27 offset
-`cx[q] + cy[q] * Nx + cz[q] * Nx * Ny`, wrapped inside the doubled virtual
-address range.
+Each population array is allocated with the CUDA Driver VMM APIs. When the
+logical population size is already granularity-aligned, that array is mapped
+twice into one reserved GPU virtual address range and the runtime control
+structure is an array of per-population start pointers. When the logical size
+is not granularity-aligned, the allocation is padded up to the VMM granularity
+and the runtime falls back to a small per-population linear-offset table while
+keeping the same single-storage VMM allocation.
 
 The collision kernel then:
 
@@ -87,7 +88,7 @@ Implemented outlet variants:
 Each timestep uses this order:
 
 1. collide and stream in place while reading and writing through the current logical view,
-2. advance the per-population VMM start pointers on the host,
+2. advance the per-population VMM control state on the host,
 3. when Mode A is active, repair the periodic `x` planes,
 4. apply wall bounce-back on y/z wall nodes,
 5. apply streamwise inlet/outlet reconstruction for Mode B or Mode C,
@@ -146,9 +147,9 @@ The solver always uses the CUDA virtual-memory streaming backend:
 - the solver links the CUDA Driver API and uses `cuMemAddressReserve` /
   `cuMemCreate` / `cuMemMap` for the population arrays,
 - runtime startup prints the actual GPU VMM granularity,
-- each per-population byte size, `Nx * Ny * Nz * sizeof(Real)`, must be an
-  exact multiple of that granularity or startup will fail with an explicit
-  error,
+- aligned populations use direct aliased start-pointer updates,
+- non-aligned populations are padded up to the VMM granularity and use a small
+  per-population linear-offset table instead of failing at startup,
 - two temporary `yz` plane buffers are allocated on the GPU for the Mode A
   periodic `x`-plane repair step.
 

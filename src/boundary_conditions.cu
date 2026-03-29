@@ -122,6 +122,18 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     int nz,
     Real* LBM_RESTRICT populations) {
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    if (view.offset != nullptr) {
+        #pragma unroll
+        for (int q = 0; q < kQ; ++q) {
+            int physical_cell = cell + view.offset[q];
+            if (physical_cell >= view.logical_cells) {
+                physical_cell -= view.logical_cells;
+            }
+            populations[q] = view.population[q][physical_cell];
+        }
+        return;
+    }
+
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         populations[q] = view.population[q][cell];
@@ -139,6 +151,15 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     int nz,
     Real value) {
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    if (view.offset != nullptr) {
+        int physical_cell = cell + view.offset[q];
+        if (physical_cell >= view.logical_cells) {
+            physical_cell -= view.logical_cells;
+        }
+        view.population[q][physical_cell] = value;
+        return;
+    }
+
     view.population[q][cell] = value;
 }
 
@@ -272,13 +293,17 @@ __global__ __launch_bounds__(kLaunchBounds) void gather_periodic_x_planes_kernel
     const int yz_cell = z * cfg.ny + y;
     Real xmin_pop[kQ];
     Real xmax_pop[kQ];
+    Real boundary_xmin[kQ];
+    Real boundary_xmax[kQ];
     load_logical_cell(view, 0, y + 1, z, cfg.nx, cfg.ny, cfg.nz, xmin_pop);
     load_logical_cell(view, cfg.nx - 1, y - 1, z, cfg.nx, cfg.ny, cfg.nz, xmax_pop);
+    load_logical_cell(view, 0, y, z, cfg.nx, cfg.ny, cfg.nz, boundary_xmin);
+    load_logical_cell(view, cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz, boundary_xmax);
 
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        xmin_plane[q * yz_count + yz_cell] = (g_cx[q] > 0) ? xmin_pop[q] : view.population[q][LBM_FLATTEN_XYZ(0, y, z, cfg.nx, cfg.ny, cfg.nz)];
-        xmax_plane[q * yz_count + yz_cell] = (g_cx[q] < 0) ? xmax_pop[q] : view.population[q][LBM_FLATTEN_XYZ(cfg.nx - 1, y, z, cfg.nx, cfg.ny, cfg.nz)];
+        xmin_plane[q * yz_count + yz_cell] = (g_cx[q] > 0) ? xmin_pop[q] : boundary_xmin[q];
+        xmax_plane[q * yz_count + yz_cell] = (g_cx[q] < 0) ? xmax_pop[q] : boundary_xmax[q];
     }
 }
 

@@ -83,6 +83,18 @@ __device__ LBM_FORCEINLINE void load_logical_cell(
     int nz,
     Real* LBM_RESTRICT populations) {
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    if (view.offset != nullptr) {
+        #pragma unroll
+        for (int q = 0; q < kQ; ++q) {
+            int physical_cell = cell + view.offset[q];
+            if (physical_cell >= view.logical_cells) {
+                physical_cell -= view.logical_cells;
+            }
+            populations[q] = view.population[q][physical_cell];
+        }
+        return;
+    }
+
     #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         populations[q] = view.population[q][cell];
@@ -100,6 +112,15 @@ __device__ LBM_FORCEINLINE void store_logical_population(
     int nz,
     Real value) {
     const int cell = LBM_FLATTEN_XYZ(x, y, z, nx, ny, nz);
+    if (view.offset != nullptr) {
+        int physical_cell = cell + view.offset[q];
+        if (physical_cell >= view.logical_cells) {
+            physical_cell -= view.logical_cells;
+        }
+        view.population[q][physical_cell] = value;
+        return;
+    }
+
     view.population[q][cell] = value;
 }
 
