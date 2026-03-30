@@ -193,11 +193,42 @@ inline constexpr std::array<Real, kQ> kWeights = {
     Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0),
     Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0)};
 
-extern __device__ __constant__ int g_cx[kQ];
-extern __device__ __constant__ int g_cy[kQ];
-extern __device__ __constant__ int g_cz[kQ];
-extern __device__ __constant__ int g_opp[kQ];
-extern __device__ __constant__ Real g_w[kQ];
+#if defined(__CUDACC__)
+// Keep the device tables in the header with explicit initializers so both CUDA
+// translation units can use the same names without carrying duplicated switch
+// helpers or relying on a runtime cudaMemcpyToSymbol setup path.
+static __device__ __constant__ int g_cx[kQ] = {
+    0,
+    1, -1, 0, 0, 0, 0,
+    1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0,
+    1, -1, 1, -1, 1, -1, 1, -1};
+
+static __device__ __constant__ int g_cy[kQ] = {
+    0,
+    0, 0, 1, -1, 0, 0,
+    1, -1, -1, 1, 0, 0, 0, 0, 1, -1, 1, -1,
+    1, -1, 1, -1, -1, 1, -1, 1};
+
+static __device__ __constant__ int g_cz[kQ] = {
+    0,
+    0, 0, 0, 0, 1, -1,
+    0, 0, 0, 0, 1, -1, -1, 1, 1, -1, -1, 1,
+    1, -1, -1, 1, 1, -1, -1, 1};
+
+static __device__ __constant__ int g_opp[kQ] = {
+    0,
+    2, 1, 4, 3, 6, 5,
+    8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17,
+    20, 19, 22, 21, 24, 23, 26, 25};
+
+static __device__ __constant__ Real g_w[kQ] = {
+    Real(8.0 / 27.0),
+    Real(2.0 / 27.0), Real(2.0 / 27.0), Real(2.0 / 27.0), Real(2.0 / 27.0), Real(2.0 / 27.0), Real(2.0 / 27.0),
+    Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0),
+    Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0), Real(1.0 / 54.0),
+    Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0),
+    Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0), Real(1.0 / 216.0)};
+#endif
 
 inline void cuda_check(cudaError_t error, const char* what) {
     if (error != cudaSuccess) {

@@ -38,12 +38,6 @@ __device__  Real _feq_mpm(Real rho, Real ux, Real uy, Real uz, Real uu) {return 
 __device__  Real _feq_mmp(Real rho, Real ux, Real uy, Real uz, Real uu) {return Wl*_dfeq(-1,-1, 1);}
 __device__  Real _feq_pmm(Real rho, Real ux, Real uy, Real uz, Real uu) {return Wl*_dfeq( 1,-1,-1);}
 
-__device__ __constant__ int g_cx[kQ];
-__device__ __constant__ int g_cy[kQ];
-__device__ __constant__ int g_cz[kQ];
-__device__ __constant__ int g_opp[kQ];
-__device__ __constant__ Real g_w[kQ];
-
 #define LBM_VMM_OFFSET_CELL(cell, offset, logical_cells) (((cell) + (offset) < (logical_cells)) ? ((cell) + (offset)) : ((cell) + (offset) - (logical_cells)))
 #define LBM_LOAD_F_ALIGNED(q) Real f_##q = view.p##q[(cell)]
 #define LBM_LOAD_F_OFFSET(q) Real f_##q = view.p##q[LBM_VMM_OFFSET_CELL((cell), offset[(q)], logical_cells)]
@@ -592,11 +586,9 @@ __global__ __launch_bounds__(kLaunchBounds) void recover_macros_kernel(
 }  // namespace
 
 void copy_lattice_constants_to_device() {
-    cuda_check(cudaMemcpyToSymbol(g_cx, kCx.data(), sizeof(int) * kQ), "copy D3Q27 cx constants");
-    cuda_check(cudaMemcpyToSymbol(g_cy, kCy.data(), sizeof(int) * kQ), "copy D3Q27 cy constants");
-    cuda_check(cudaMemcpyToSymbol(g_cz, kCz.data(), sizeof(int) * kQ), "copy D3Q27 cz constants");
-    cuda_check(cudaMemcpyToSymbol(g_opp, kOpp.data(), sizeof(int) * kQ), "copy D3Q27 opposite constants");
-    cuda_check(cudaMemcpyToSymbol(g_w, kWeights.data(), sizeof(Real) * kQ), "copy D3Q27 weight constants");
+    // Device constant tables are now initialized in src/lbm.cuh, so nothing
+    // needs to be copied at runtime. Keep this function to avoid churn in the
+    // existing startup path.
 }
 
 void launch_classify_nodes(std::uint8_t* d_node_type, const SimulationConfig& cfg) {
